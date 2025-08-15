@@ -1,7 +1,6 @@
 import os
 import logging
 import asyncio
-import signal
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from dotenv import load_dotenv
@@ -94,12 +93,12 @@ async def main():
     application.add_handler(MessageHandler(filters.Document.VIDEO | filters.VIDEO, handle_video))
     application.add_handler(CallbackQueryHandler(button_callback))
     
+    # Use the library's context manager for graceful setup and shutdown
     async with application:
         logger.info(f"Starting webhook on port {PORT}")
-        # Set the webhook
         await application.bot.set_webhook(url=f"{APP_URL}/{BOT_TOKEN}")
         
-        # Start the webhook listener
+        # Start the webhook listener without the redundant application.start()
         await application.start_webhook(
             listen="0.0.0.0",
             port=PORT,
@@ -112,13 +111,6 @@ async def main():
 
 
 if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
-    main_task = loop.create_task(main())
+    # Use the simple, correct way to run an asyncio application
+    asyncio.run(main())
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, main_task.cancel)
-
-    try:
-        loop.run_until_complete(main_task)
-    except asyncio.CancelledError:
-        logger.info("Main task cancelled. Shutting down gracefully.")
