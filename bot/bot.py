@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import signal # <-- NEW IMPORT
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from dotenv import load_dotenv
@@ -31,23 +32,19 @@ UNAUTHORIZED_MESSAGE = (
     "If you believe you should have access, please contact the bot administrator."
 )
 
-# --- Command Handlers ---
+# --- Command Handlers (No changes here) ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Greets the user and checks if they are authorized."""
     user_id = update.effective_user.id
     if user_id in ADMIN_USER_IDS:
         await update.message.reply_text("👋 Hello! I'm your friendly encoding bot. Send me a video file to get started.")
     else:
-        # Use the new, more polite message
         await update.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode='Markdown')
     logger.info(f"User {user_id} ({update.effective_user.username}) used /start.")
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles incoming video files."""
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
-        # Use the new, more polite message here too for consistency
         await update.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode='Markdown')
         return
 
@@ -70,7 +67,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Parses the CallbackQuery and delegates to the right handler."""
     query = update.callback_query
     await query.answer()
     action, quality, file_id = query.data.split('_')
@@ -79,10 +75,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Sending job to Celery: user={query.from_user.id}, file_id={file_id}, quality={quality}")
         encode_video_task.delay(user_id=query.from_user.id, file_id=file_id, quality=quality)
 
-# --- Main Application ---
 
+# --- NEW: Graceful Shutdown Logic ---
+async def graceful_shutdown(application: Application):
+    logger.info("Bot is shutting down...")
+    await application.shutdown()
+
+# --- Main Application ---
 async def main():
-    """Starts the bot using webhooks."""
     if not BOT_TOKEN:
         logger.critical("BOT_TOKEN environment variable is not set! Exiting.")
         return
@@ -99,15 +99,36 @@ async def main():
     application.add_handler(MessageHandler(filters.Document.VIDEO | filters.VIDEO, handle_video))
     application.add_handler(CallbackQueryHandler(button_callback))
     
-    logger.info(f"Starting webhook on port {PORT}")
-    await application.bot.set_webhook(url=f"{APP_URL}/{BOT_TOKEN}")
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=BOT_TOKEN,
-        webhook_url=f"{APP_URL}/{BOT_TOKEN}"
-    )
+    # Run the bot until the user presses Ctrl-C or the process receives SIGINT,
+    # SIGTERM or SIGABRT. This is the recommended way to run a PTB application gracefully.
+    async with application:
+        logger.info(f"Starting webhook on port {PORT}")
+        await application.bot.set_webhook(url=f"{APP_URL}/{BOT_TOKEN}")
+        await application.start()
+        await application.start_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=BOT_TOKEN
+        )
+        
+        # Keep the application running until a shutdown signal is received
+        # We create a Future that will never resolve, effectively pausing the main coroutine
+        stop_event = asyncio.Event()
+        await stop_event.wait()
+
 
 if __name__ == '__main__':
-    asyncio.run(main())
-    
+    # This block is now more complex to handle graceful shutdowns correctly.
+    # It replaces the simple `asyncio.run(main())`
+    loop = asyncio.get_event_loop()
+    main_task = loop.create_task(main())
+
+    # This is how we listen for shutdown signals
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, main_task.cancel)
+
+    try:
+        loop.run_until_complete(main_task)
+    except asyncio.CancelledError:
+        logger.info("Main task cancelled. Shutting down gracefully.")
+        
