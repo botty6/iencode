@@ -1,7 +1,7 @@
 {
   "name": "Telegram Encoder Bot",
   "description": "A powerful video encoding bot using Python, Celery, and FFmpeg.",
-  "repository": "https://github.com/YOUR_USERNAME/YOUR_REPOSITORY",
+  "repository": "https://github.com/botty6/iencode",
   "logo": "https://i.imgur.com/8rq4sJt.png",
   "keywords": ["python", "telegram", "bot", "ffmpeg", "celery", "video"],
   "stack": "heroku-22",
