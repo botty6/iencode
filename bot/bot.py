@@ -17,7 +17,6 @@ from worker.tasks import encode_video_task
 
 # ------- Load env & logging -------
 load_dotenv()
-
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -27,7 +26,6 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 APP_URL = (os.getenv("APP_URL") or "").strip()
 PORT = int(os.getenv("PORT", "8443"))
-# A list of common video file extensions for fallback checking
 VIDEO_EXTENSIONS = (".mkv", ".mp4", ".webm", ".avi", ".mov", ".flv", ".wmv")
 
 try:
@@ -73,7 +71,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info("File handler triggered for user %s.", user_id) # <-- ADDED LOGGING
+    logger.info("File handler triggered for user %s.", user_id)
 
     if user_id not in ADMIN_USER_IDS:
         await update.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode="Markdown")
@@ -81,41 +79,33 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     video_file = update.message.document or update.message.video
     if not video_file:
-        # This should ideally not be reached if the filter is correct
         logger.warning("handle_video triggered but no video or document found.")
         return
 
     file_name = getattr(video_file, "file_name", "unknown_file")
     mime_type = getattr(video_file, "mime_type", "unknown_mime")
-    logger.info("Received file. Name: '%s', MIME Type: '%s'", file_name, mime_type) # <-- ADDED LOGGING
+    logger.info("Received file. Name: '%s', MIME Type: '%s'", file_name, mime_type)
 
-    # This is our new, more robust check for a valid video file
-    is_video = (
-        mime_type.startswith("video/") or
-        file_name.lower().endswith(VIDEO_EXTENSIONS)
-    )
-
+    is_video = mime_type.startswith("video/") or file_name.lower().endswith(VIDEO_EXTENSIONS)
     if not is_video:
-        logger.info("File '%s' is not a video. Replying to user.", file_name) # <-- ADDED LOGGING
+        logger.info("File '%s' is not a video. Replying to user.", file_name)
         await update.message.reply_text(
             "🤔 This doesn't look like a video file I can process. Please send a file like .mkv, .mp4, etc."
         )
         return
 
+    # This is the key change: Store the file_id in the user's context data.
+    context.user_data["last_file_id"] = video_file.file_id
+    logger.info("Stored file_id %s for user %s", video_file.file_id, user_id)
+
     safe_name = file_name.replace("_", "\\_")
+    
+    # The callback_data is now very short, containing only the action and quality.
     keyboard = [
+        [InlineKeyboardButton("✅ 720p (Default)", callback_data="encode|720")],
         [
-            InlineKeyboardButton(
-                "✅ 720p (Default)", callback_data=f"encode|720|{video_file.file_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🚀 1080p", callback_data=f"encode|1080|{video_file.file_id}"
-            ),
-            InlineKeyboardButton(
-                "💾 480p", callback_data=f"encode|480|{video_file.file_id}"
-            ),
+            InlineKeyboardButton("🚀 1080p", callback_data="encode|1080"),
+            InlineKeyboardButton("💾 480p", callback_data="encode|480"),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -130,8 +120,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    # This is the other key change: Retrieve the file_id from context data.
+    file_id = context.user_data.get("last_file_id")
+
+    if not file_id:
+        await query.edit_message_text("❌ Error: I've forgotten which file you sent. Please send it again.")
+        logger.warning("last_file_id not found in user_data for user %s", query.from_user.id)
+        return
+
     try:
-        action, quality, file_id = query.data.split("|", 2)
+        action, quality = query.data.split("|", 1)
     except Exception:
         await query.edit_message_text("❌ Invalid selection data.")
         logger.exception("Failed to parse callback data: %r", query.data)
@@ -154,27 +152,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------- App factory -------
 def build_app() -> Application:
     application = Application.builder().token(BOT_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start_command))
-    # This filter is now broader to catch all documents and videos.
-    application.add_handler(
-        MessageHandler(filters.VIDEO | filters.Document.ALL, handle_video)
-    )
+    application.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, handle_video))
     application.add_handler(CallbackQueryHandler(button_callback))
     return application
 
 # ------- Entrypoint -------
 def main() -> None:
     _validate_config()
-
     try:
         asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-
     app = build_app()
-
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
