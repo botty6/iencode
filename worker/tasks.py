@@ -23,8 +23,8 @@ if REDIS_URL.startswith("rediss://"):
 celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
 
 async def _run_async_task(user_chat_id: int, message_id: int, quality: str):
-    # This client logs in as a bot. As confirmed by our research,
-    # Pyrogram's MTProto backend allows it to download large files.
+    # This is the key change: The client is now created *inside* the task.
+    # It connects, does its job, and disconnects, leaving the main bot's connection untouched.
     app = Client("worker_session", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, in_memory=True)
     
     await app.start()
@@ -73,4 +73,4 @@ async def _run_async_task(user_chat_id: int, message_id: int, quality: str):
 @celery_app.task(name="worker.tasks.encode_video_task")
 def encode_video_task(user_chat_id: int, message_id: int, quality: str):
     asyncio.run(_run_async_task(user_chat_id, message_id, quality))
-            
+    
