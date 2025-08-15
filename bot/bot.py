@@ -1,178 +1,107 @@
 import os
 import logging
-import asyncio
-from urllib.parse import urlparse
-
-from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+from pyrogram import Client, filters
+from pyrogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from worker.tasks import encode_video_task
 
-# ------- Load env & logging -------
+# ------- Configuration -------
+# Load environment variables from .env file for local development
+from dotenv import load_dotenv
 load_dotenv()
+
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ------- Explicit configuration -------
-BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-APP_URL = (os.getenv("APP_URL") or "").strip()
-PORT = int(os.getenv("PORT", "8443"))
+# Explicitly read and strip environment variables for robustness
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
+API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
+ADMIN_USER_IDS = [int(uid.strip()) for uid in os.getenv("ADMIN_USER_IDS", "").split(",") if uid.strip()]
+
+# Pyrogram Client - this is our single bot instance
+# We set workdir to /tmp to work on Heroku's ephemeral filesystem
+app = Client("encoder_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp")
+
+# --- Constants ---
+UNAUTHORIZED_MESSAGE = (
+    "👋 Welcome!\nThis is a private bot. "
+    "If you believe you should have access, please contact the administrator."
+)
 VIDEO_EXTENSIONS = (".mkv", ".mp4", ".webm", ".avi", ".mov", ".flv", ".wmv")
 
-try:
-    ADMIN_USER_IDS = [
-        int(uid.strip())
-        for uid in (os.getenv("ADMIN_USER_IDS") or "").split(",")
-        if uid.strip()
-    ]
-except ValueError:
-    logger.error("ADMIN_USER_IDS must be a comma-separated list of integers.")
-    ADMIN_USER_IDS = []
-
-UNAUTHORIZED_MESSAGE = (
-    "👋 Welcome to the **Video Encoder Bot**!\n\n"
-    "This is a private service, and your User ID is not on the authorized list. "
-    "If you believe you should have access, please contact the bot administrator."
-)
-
-# ------- Validation -------
-def _validate_config() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set.")
-    if not APP_URL:
-        raise RuntimeError("APP_URL is not set.")
-    parsed = urlparse(APP_URL)
-    if parsed.scheme != "https":
-        logger.warning("APP_URL is not HTTPS; Telegram requires HTTPS in production.")
-    if not parsed.netloc:
-        raise RuntimeError("APP_URL is invalid (no host).")
-    if not isinstance(PORT, int) or PORT <= 0:
-        raise RuntimeError("PORT must be a positive integer.")
-
 # ------- Handlers -------
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in ADMIN_USER_IDS:
-        await update.message.reply_text(
-            "👋 Hello! I'm your friendly encoding bot. Send me a video file to get started."
-        )
+
+@app.on_message(filters.command("start") & filters.private)
+async def start_command(client: Client, message: Message):
+    """Handles the /start command."""
+    if message.from_user.id in ADMIN_USER_IDS:
+        await message.reply_text("👋 Hello! Send me a video file to get started.")
     else:
-        await update.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode="Markdown")
-    logger.info("User %s (%s) used /start.", user_id, update.effective_user.username)
+        await message.reply_text(UNAUTHORIZED_MESSAGE)
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    logger.info("File handler triggered for user %s.", user_id)
-
-    if user_id not in ADMIN_USER_IDS:
-        await update.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode="Markdown")
+@app.on_message((filters.video | filters.document) & filters.private)
+async def handle_video(client: Client, message: Message):
+    """Handles incoming video or document files."""
+    if message.from_user.id not in ADMIN_USER_IDS:
+        await message.reply_text(UNAUTHORIZED_MESSAGE)
         return
 
-    video_file = update.message.document or update.message.video
-    if not video_file:
-        logger.warning("handle_video triggered but no video or document found.")
-        return
-
-    file_name = getattr(video_file, "file_name", "unknown_file")
-    mime_type = getattr(video_file, "mime_type", "unknown_mime")
-    logger.info("Received file. Name: '%s', MIME Type: '%s'", file_name, mime_type)
+    file = message.video or message.document
+    file_name = getattr(file, "file_name", "unknown_file.tmp")
+    mime_type = getattr(file, "mime_type", "application/octet-stream")
 
     is_video = mime_type.startswith("video/") or file_name.lower().endswith(VIDEO_EXTENSIONS)
     if not is_video:
-        logger.info("File '%s' is not a video. Replying to user.", file_name)
-        await update.message.reply_text(
-            "🤔 This doesn't look like a video file I can process. Please send a file like .mkv, .mp4, etc."
-        )
+        await message.reply_text("🤔 This doesn't look like a video file I can process.")
         return
-
-    # This is the key change: Store the file_id in the user's context data.
-    context.user_data["last_file_id"] = video_file.file_id
-    logger.info("Stored file_id %s for user %s", video_file.file_id, user_id)
-
-    safe_name = file_name.replace("_", "\\_")
-    
-    # The callback_data is now very short, containing only the action and quality.
-    keyboard = [
-        [InlineKeyboardButton("✅ 720p (Default)", callback_data="encode|720")],
+        
+    # We pass the chat_id and message_id to the worker so it can fetch the message
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 720p", callback_data=f"encode|720|{message.id}")],
         [
-            InlineKeyboardButton("🚀 1080p", callback_data="encode|1080"),
-            InlineKeyboardButton("💾 480p", callback_data="encode|480"),
-        ],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        f"🎬 Received file: `{safe_name}`\n\nPlease choose an output quality:",
-        reply_markup=reply_markup,
-        parse_mode="Markdown",
+            InlineKeyboardButton("🚀 1080p", callback_data=f"encode|1080|{message.id}"),
+            InlineKeyboardButton("💾 480p", callback_data=f"encode|480|{message.id}"),
+        ]
+    ])
+    await message.reply_text(
+        f"🎬 Received file: `{file_name}`\nPlease choose an output quality:",
+        reply_markup=keyboard,
     )
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    # This is the other key change: Retrieve the file_id from context data.
-    file_id = context.user_data.get("last_file_id")
-
-    if not file_id:
-        await query.edit_message_text("❌ Error: I've forgotten which file you sent. Please send it again.")
-        logger.warning("last_file_id not found in user_data for user %s", query.from_user.id)
+@app.on_callback_query()
+async def button_callback(client: Client, callback_query: CallbackQuery):
+    """Handles button presses from the inline keyboard."""
+    user_id = callback_query.from_user.id
+    if user_id not in ADMIN_USER_IDS:
+        await callback_query.answer("🚫 You are not authorized for this action.", show_alert=True)
         return
 
     try:
-        action, quality = query.data.split("|", 1)
-    except Exception:
-        await query.edit_message_text("❌ Invalid selection data.")
-        logger.exception("Failed to parse callback data: %r", query.data)
+        action, quality, message_id = callback_query.data.split("|", 2)
+    except ValueError:
+        await callback_query.answer("❌ Invalid button data.", show_alert=True)
         return
 
     if action == "encode":
-        await query.edit_message_text(
-            text=f"✅ Great! Queueing file for a {quality}p encode. I'll let you know when it's done!"
-        )
-        logger.info(
-            "Queueing Celery job: user=%s, file_id=%s, quality=%s",
-            query.from_user.id,
-            file_id,
-            quality,
-        )
+        await callback_query.answer("✅ Job sent to queue!")
+        await callback_query.message.edit_text(f"⏳ Your file is now in the queue for a {quality}p encode...")
+        
+        # Send the job to the Celery worker
         encode_video_task.delay(
-            user_id=query.from_user.id, file_id=file_id, quality=quality
+            user_chat_id=callback_query.message.chat.id,
+            message_id=int(message_id),
+            quality=quality,
         )
 
-# ------- App factory -------
-def build_app() -> Application:
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, handle_video))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    return application
-
-# ------- Entrypoint -------
-def main() -> None:
-    _validate_config()
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    app = build_app()
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=BOT_TOKEN,
-        webhook_url=f"{APP_URL}/{BOT_TOKEN}",
-    )
-
-if __name__ == "__main__":
-    main()
-    
+# --- Entrypoint ---
+# Pyrogram will automatically handle starting its own web server for webhooks.
+# This single line is all that's needed to start the bot.
+app.run()
