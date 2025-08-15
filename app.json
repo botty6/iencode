@@ -15,7 +15,7 @@
   ],
   "addons": [
     {
-      "plan": "heroku-redis:basic-0",
+      "plan": "heroku-redis:hobby-dev",
       "as": "REDIS"
     }
   ],
