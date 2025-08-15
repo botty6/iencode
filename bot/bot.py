@@ -9,8 +9,6 @@ from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-# This is the crucial, correct import for the raw API function
-from pyrogram.raw.functions.bots import SetBotWebhook
 from worker.tasks import encode_video_task
 
 # --- Configuration ---
@@ -22,26 +20,21 @@ API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 ADMIN_USER_IDS = [int(uid.strip()) for uid in os.getenv("ADMIN_USER_IDS", "").split(",") if uid.strip()]
 PORT = int(os.getenv("PORT", "8080"))
-APP_URL = os.getenv("APP_URL")
 
 # --- Pyrogram Client Initialization ---
 app = Client("encoder_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp")
 
-# --- Constants ---
-UNAUTHORIZED_MESSAGE = "👋 Welcome!\nThis is a private bot and you are not authorized to use it."
-
-# --- Handlers (These are correct and do not need changes) ---
+# --- Handlers (No changes needed here) ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
     if message.from_user.id in ADMIN_USER_IDS:
         await message.reply_text("👋 Hello! Send me a video file to get started.")
     else:
-        await message.reply_text(UNAUTHORIZED_MESSAGE)
+        await message.reply_text("👋 Welcome!\nThis is a private bot and you are not authorized to use it.")
 
 @app.on_message((filters.video | filters.document) & filters.private)
 async def handle_video(client, message):
     if message.from_user.id not in ADMIN_USER_IDS:
-        await message.reply_text(UNAUTHORIZED_MESSAGE)
         return
     file = message.video or message.document
     file_name = getattr(file, "file_name", "unknown_file.tmp")
@@ -56,6 +49,7 @@ async def handle_video(client, message):
 
 @app.on_callback_query()
 async def button_callback(client, callback_query):
+    # ... (callback logic remains the same)
     user_id = callback_query.from_user.id
     if user_id not in ADMIN_USER_IDS:
         await callback_query.answer("🚫 You are not authorized.", show_alert=True)
@@ -70,50 +64,38 @@ async def button_callback(client, callback_query):
             quality=quality,
         )
 
-# --- aiohttp Web Server for Heroku ---
-async def webhook_handler(request: web.Request):
-    client = request.app["client"]
-    try:
-        await client.feed_update(await request.json())
-    except Exception as e:
-        logger.error("Could not feed update to Pyrogram: %s", e)
-    finally:
-        return web.Response(status=200)
+# --- Keep-Alive Web Server for Heroku ---
+async def health_check(request):
+    """A simple endpoint Heroku can ping to see if the dyno is alive."""
+    return web.Response(text="OK")
 
-async def main():
-    if not all([BOT_TOKEN, API_ID, API_HASH, APP_URL]):
-        logger.critical("One or more critical environment variables are missing!")
-        return
-
+async def start_web_server():
+    """Starts the minimal aiohttp web server."""
     webapp = web.Application()
-    webapp.add_routes([web.post(f"/{BOT_TOKEN}", webhook_handler)])
-    webapp["client"] = app
-
+    webapp.add_routes([web.get("/", health_check)])
     runner = web.AppRunner(webapp)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
-    
-    await app.start()
-    
-    # This is the final, correct way to set the webhook.
-    webhook_url = f"{APP_URL}/{BOT_TOKEN}"
-    await app.invoke(
-        SetBotWebhook(
-            url=webhook_url,
-            max_connections=40  # A sensible default
-        )
-    )
-    logger.info(f"Webhook set to {webhook_url}")
-    
-    logger.info(f"Web server started on port {PORT}")
+    logger.info(f"Starting keep-alive web server on port {PORT}")
     await site.start()
-    
-    await asyncio.Event().wait()
 
 # --- Main Entrypoint ---
+async def main():
+    """Starts the web server and the Pyrogram polling client together."""
+    if not all([BOT_TOKEN, API_ID, API_HASH]):
+        logger.critical("One or more critical environment variables are missing!")
+        return
+    
+    # asyncio.gather runs both tasks concurrently.
+    await asyncio.gather(
+        start_web_server(),
+        app.run()  # app.run() with no arguments starts the polling client.
+    )
+
 if __name__ == "__main__":
+    logger.info("Starting bot...")
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped.")
-        
+
