@@ -24,7 +24,6 @@ except (ValueError, AttributeError):
     logger.error("ADMIN_USER_IDS is not set correctly. Please provide a comma-separated list of numbers.")
     ADMIN_USER_IDS = []
 
-# --- A more welcoming message for unauthorized users ---
 UNAUTHORIZED_MESSAGE = (
     "👋 Welcome to the **Video Encoder Bot**!\n\n"
     "This is a private service, and your User ID is not on the authorized list. "
@@ -78,37 +77,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def main():
     """Starts the bot."""
+    # This check ensures we don't start without critical configs.
     if not BOT_TOKEN:
         logger.critical("BOT_TOKEN environment variable is not set! Exiting.")
         return
     if not APP_URL:
         logger.critical("APP_URL environment variable is not set! Exiting.")
         return
-    if not ADMIN_USER_IDS:
-        logger.warning("ADMIN_USER_IDS is not set. The bot will not respond to anyone.")
 
+    # Build the application object.
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Add handlers
+    # Register all our command and message handlers.
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.Document.VIDEO | filters.VIDEO, handle_video))
     application.add_handler(CallbackQueryHandler(button_callback))
     
-    # Use the library's context manager for graceful setup and shutdown
-    async with application:
-        logger.info(f"Setting webhook...")
-        await application.bot.set_webhook(url=f"{APP_URL}/{BOT_TOKEN}")
-        
-        # Start the webhook listener. This is the correct method name.
-        # This call runs forever and is gracefully shut down by the `async with` block.
-        logger.info(f"Starting webhook server on port {PORT}")
-        await application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=BOT_TOKEN
-        )
+    # This is the single, all-in-one command to start the webhook bot.
+    # It handles initialization, setting the webhook, starting the server, and graceful shutdown.
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_TOKEN,
+        webhook_url=f"{APP_URL}/{BOT_TOKEN}"
+    )
 
 if __name__ == '__main__':
-    # Use the simple, correct way to run an asyncio application
+    # This is the standard, correct way to start an asyncio program.
     asyncio.run(main())
-
+    
