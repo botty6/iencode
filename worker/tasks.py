@@ -3,6 +3,8 @@ import logging
 import asyncio
 import subprocess
 import tempfile
+
+import httpx  # Import the HTTP library
 from celery import Celery
 from telegram import Bot
 from telegram.constants import ParseMode
@@ -24,15 +26,11 @@ if REDIS_URL.startswith("rediss://"):
 
 celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
 
-# ------- This new async function will contain all our Telegram API calls -------
+# ------- This async function contains all our Telegram API calls -------
 async def _run_async_task(user_id: int, file_id: str, quality: str):
-    """
-    Runs all async logic for a task in a single event loop.
-    """
     bot = Bot(token=BOT_TOKEN)
-    
     await bot.send_message(
-        chat_id=user_id, text="⚙️ Your encoding job has started! I'm downloading the file now..."
+        chat_id=user_id, text="⚙️ Your encoding job has started! Preparing to download..."
     )
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -41,16 +39,27 @@ async def _run_async_task(user_id: int, file_id: str, quality: str):
         output_path = os.path.join(temp_dir, output_filename)
 
         try:
-            # 1. Download the file
+            # 1. Get the File object which contains the download path
+            logging.info("Fetching file path from Telegram...")
             file_obj = await bot.get_file(file_id)
-            await file_obj.download_to_drive(input_path)
+
+            # 2. Construct the direct download URL and download the file
+            download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_obj.file_path}"
+            logging.info("Downloading file from direct URL...")
+
+            async with httpx.AsyncClient() as client:
+                with open(input_path, "wb") as f:
+                    async with client.stream("GET", download_url, timeout=60.0) as response:
+                        response.raise_for_status()  # Will raise an error for 4xx/5xx responses
+                        async for chunk in response.aiter_bytes():
+                            f.write(chunk)
 
             await bot.send_message(
                 chat_id=user_id,
                 text=f"✅ Download complete! Starting the {quality}p encode. This might take a while... ⏳",
             )
 
-            # 2. Run FFmpeg (This is a blocking, synchronous call)
+            # 3. Run FFmpeg (This is a blocking, synchronous call)
             ffmpeg_command = [
                 "ffmpeg", "-i", input_path, "-c:v", "libx265", "-preset", "slow",
                 "-crf", "24", "-vf", f"scale=-2:{quality}", "-c:a", "aac",
@@ -66,7 +75,7 @@ async def _run_async_task(user_id: int, file_id: str, quality: str):
                 )
                 return
 
-            # 3. Upload the result
+            # 4. Upload the result
             await bot.send_message(
                 chat_id=user_id, text="🎉 Success! Your file is encoded. Now uploading..."
             )
@@ -78,9 +87,12 @@ async def _run_async_task(user_id: int, file_id: str, quality: str):
                 chat_id=user_id, text="🚀 Upload complete! Job finished."
             )
 
+        except httpx.HTTPStatusError as e:
+             logging.error(f"HTTP error while downloading file for user {user_id}: {e}")
+             await bot.send_message(chat_id=user_id, text=f"💥 A critical error occurred: Failed to download the file from Telegram's servers. Please try again.")
+
         except Exception as e:
             logging.error(f"An error occurred in the async task part for user {user_id}: {e}")
-            # Use the bot object to report the error if it's available
             try:
                 await bot.send_message(chat_id=user_id, text=f"💥 A critical error occurred during your job: {e}")
             except Exception as e2:
@@ -93,11 +105,8 @@ def encode_video_task(user_id: int, file_id: str, quality: str):
     Synchronous Celery task that calls our async wrapper.
     """
     try:
-        # We call asyncio.run() only ONCE here.
         asyncio.run(_run_async_task(user_id, file_id, quality))
     except Exception as e:
-        # This will catch any unexpected errors during the entire async process
         logging.error(f"A top-level error occurred in the encoding task for user {user_id}: {e}")
-
     logging.info(f"Finished job for user {user_id}, file_id {file_id}")
-    
+
