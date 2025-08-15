@@ -14,7 +14,21 @@ load_dotenv()
 # --- Celery and Bot Configuration ---
 
 # Heroku provides the REDIS_URL env var for the Redis add-on
-REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+REDIS_URL = os.environ.get('REDIS_URL')
+
+# Fallback for local development
+if not REDIS_URL:
+    REDIS_URL = 'redis://localhost:6379/0'
+
+# --- THIS IS THE FIX ---
+# IMPORTANT: Heroku Redis uses secure 'rediss://' URLs.
+# Recent Celery versions require an explicit SSL setting for these.
+if REDIS_URL.startswith('rediss://'):
+    # Appends the required SSL cert validation setting.
+    # CERT_NONE is standard for Heroku's internal networking.
+    REDIS_URL = f"{REDIS_URL}?ssl_cert_reqs=CERT_NONE"
+# --- END OF FIX ---
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BRANDING_TEXT = os.environ.get("BRANDING_TEXT", "MyEnc")
 
@@ -109,4 +123,3 @@ def encode_video_task(user_id: int, file_id: str, quality: str):
             asyncio.run(send_telegram_message(user_id, f"💥 A critical error occurred during your job: {e}"))
 
     logging.info(f"Finished job for user {user_id}, file_id {file_id}")
-  
