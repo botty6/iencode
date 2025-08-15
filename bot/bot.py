@@ -77,6 +77,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Main Application ---
 
 async def main():
+    """Starts the bot."""
     if not BOT_TOKEN:
         logger.critical("BOT_TOKEN environment variable is not set! Exiting.")
         return
@@ -95,20 +96,17 @@ async def main():
     
     # Use the library's context manager for graceful setup and shutdown
     async with application:
-        logger.info(f"Starting webhook on port {PORT}")
+        logger.info(f"Setting webhook...")
         await application.bot.set_webhook(url=f"{APP_URL}/{BOT_TOKEN}")
         
-        # Start the webhook listener without the redundant application.start()
-        await application.start_webhook(
+        # Start the webhook listener. This is the correct method name.
+        # This call runs forever and is gracefully shut down by the `async with` block.
+        logger.info(f"Starting webhook server on port {PORT}")
+        await application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path=BOT_TOKEN
         )
-        
-        # Keep the application running
-        stop_event = asyncio.Event()
-        await stop_event.wait()
-
 
 if __name__ == '__main__':
     # Use the simple, correct way to run an asyncio application
