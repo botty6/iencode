@@ -1,6 +1,10 @@
+# bot.py
 import os
 import logging
 import asyncio
+from urllib.parse import urlparse
+
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -8,23 +12,32 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
-    filters
+    filters,
 )
-from dotenv import load_dotenv
 from worker.tasks import encode_video_task
 
-# --- CONFIGURATION ---
+# ------- Load env & logging -------
 load_dotenv()
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-APP_URL = os.environ.get("APP_URL")  # Must be HTTPS
-PORT = int(os.environ.get("PORT", 8443))
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("video-encoder-bot")
+
+# ------- Explicit configuration -------
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+APP_URL = (os.getenv("APP_URL") or "").strip()  # must be public HTTPS
+PORT = int(os.getenv("PORT", "8443"))
 
 try:
     ADMIN_USER_IDS = [
-        int(uid.strip()) for uid in os.environ.get("ADMIN_USER_IDS", "").split(",") if uid.strip()
+        int(uid.strip())
+        for uid in (os.getenv("ADMIN_USER_IDS") or "").split(",")
+        if uid.strip()
     ]
 except ValueError:
+    logger.error("ADMIN_USER_IDS must be a comma-separated list of integers.")
     ADMIN_USER_IDS = []
 
 UNAUTHORIZED_MESSAGE = (
@@ -33,14 +46,21 @@ UNAUTHORIZED_MESSAGE = (
     "If you believe you should have access, please contact the bot administrator."
 )
 
-# --- LOGGING ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# ------- Validation (fail fast, clear logs) -------
+def _validate_config() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set.")
+    if not APP_URL:
+        raise RuntimeError("APP_URL is not set.")
+    parsed = urlparse(APP_URL)
+    if parsed.scheme != "https":
+        logger.warning("APP_URL is not HTTPS; Telegram requires HTTPS in production.")
+    if not parsed.netloc:
+        raise RuntimeError("APP_URL is invalid (no host).")
+    if not isinstance(PORT, int) or PORT <= 0:
+        raise RuntimeError("PORT must be a positive integer.")
 
-# --- COMMAND HANDLERS ---
+# ------- Handlers -------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in ADMIN_USER_IDS:
@@ -49,7 +69,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode="Markdown")
-    logger.info(f"User {user_id} ({update.effective_user.username}) used /start.")
+    logger.info("User %s (%s) used /start.", user_id, update.effective_user.username)
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -64,60 +84,83 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Escape underscores for legacy Markdown; keep simple and safe
+    safe_name = (getattr(video_file, "file_name", None) or "video").replace("_", "\\_")
+
+    # Use '|' so underscores inside IDs don't break parsing
     keyboard = [
-        [InlineKeyboardButton("✅ 720p (Default)", callback_data=f"encode_720_{video_file.file_id}")],
+        [InlineKeyboardButton("✅ 720p (Default)", callback_data=f"encode|720|{video_file.file_id}")],
         [
-            InlineKeyboardButton("🚀 1080p", callback_data=f"encode_1080_{video_file.file_id}"),
-            InlineKeyboardButton("💾 480p", callback_data=f"encode_480_{video_file.file_id}")
+            InlineKeyboardButton("🚀 1080p", callback_data=f"encode|1080|{video_file.file_id}"),
+            InlineKeyboardButton("💾 480p", callback_data=f"encode|480|{video_file.file_id}"),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        f"🎬 Received file: `{video_file.file_name}`\n\nPlease choose an output quality:",
+        f"🎬 Received file: `{safe_name}`\n\nPlease choose an output quality:",
         reply_markup=reply_markup,
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    # Safer parsing in case file_id contains underscores
-    parts = query.data.split("_", 2)
-    if len(parts) != 3:
+    try:
+        action, quality, file_id = query.data.split("|", 2)
+    except Exception:
         await query.edit_message_text("❌ Invalid selection data.")
+        logger.exception("Failed to parse callback data: %r", query.data)
         return
 
-    action, quality, file_id = parts
     if action == "encode":
         await query.edit_message_text(
             text=f"✅ Great! Queueing file for a {quality}p encode. I'll let you know when it's done!"
         )
-        logger.info(f"Sending job to Celery: user={query.from_user.id}, file_id={file_id}, quality={quality}")
+        logger.info(
+            "Queueing Celery job: user=%s, file_id=%s, quality=%s",
+            query.from_user.id,
+            file_id,
+            quality,
+        )
+        # Celery task must accept keyword args
         encode_video_task.delay(user_id=query.from_user.id, file_id=file_id, quality=quality)
 
-# --- MAIN ---
-def main():
-    if not BOT_TOKEN:
-        logger.critical("BOT_TOKEN environment variable is not set! Exiting.")
-        return
-    if not APP_URL:
-        logger.critical("APP_URL environment variable is not set! Exiting.")
-        return
-
+# ------- App factory -------
+def build_app() -> Application:
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(MessageHandler(filters.Document.VIDEO | filters.VIDEO, handle_video))
+    application.add_handler(
+        MessageHandler(
+            # robust: native videos OR documents with video/*
+            filters.VIDEO | filters.Document.MimeType("video/"),
+            handle_video,
+        )
+    )
     application.add_handler(CallbackQueryHandler(button_callback))
+    return application
 
-    # Run webhook server (Python 3.10 automatically manages event loop)
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=BOT_TOKEN,
-        webhook_url=f"{APP_URL}/{BOT_TOKEN}"
+# ------- Entrypoint (clean loop setup; no nest_asyncio, no asyncio.run) -------
+def main() -> None:
+    _validate_config()
+
+    # Ensure a current event loop exists (fixes "no current event loop" on some hosts)
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    app = build_app()
+
+    # Blocking call; PTB manages its own asyncio machinery internally.
+    app.run_webhook(
+        listen="0.0.0.0",                 # explicit host for Heroku/Docker
+        port=PORT,                        # Heroku provides $PORT
+        url_path=BOT_TOKEN,               # unique path (simple obscurity)
+        webhook_url=f"{APP_URL}/{BOT_TOKEN}",  # full public HTTPS webhook
     )
 
 if __name__ == "__main__":
