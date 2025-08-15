@@ -24,7 +24,7 @@ PORT = int(os.getenv("PORT", "8080"))
 # --- Pyrogram Client Initialization ---
 app = Client("encoder_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp")
 
-# --- Handlers (No changes needed here) ---
+# --- Handlers (No changes) ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
     if message.from_user.id in ADMIN_USER_IDS:
@@ -49,7 +49,6 @@ async def handle_video(client, message):
 
 @app.on_callback_query()
 async def button_callback(client, callback_query):
-    # ... (callback logic remains the same)
     user_id = callback_query.from_user.id
     if user_id not in ADMIN_USER_IDS:
         await callback_query.answer("🚫 You are not authorized.", show_alert=True)
@@ -64,38 +63,33 @@ async def button_callback(client, callback_query):
             quality=quality,
         )
 
-# --- Keep-Alive Web Server for Heroku ---
-async def health_check(request):
-    """A simple endpoint Heroku can ping to see if the dyno is alive."""
-    return web.Response(text="OK")
+# --- Main Entrypoint ---
+async def main():
+    """Starts the web server and the Pyrogram client together."""
+    if not all([BOT_TOKEN, API_ID, API_HASH]):
+        logger.critical("One or more critical environment variables are missing!")
+        return
 
-async def start_web_server():
-    """Starts the minimal aiohttp web server."""
+    # Start the Pyrogram client in the background.
+    # .start() is non-blocking and lets the client listen for updates.
+    await app.start()
+    
+    # Start the aiohttp web server to keep the Heroku dyno alive.
     webapp = web.Application()
-    webapp.add_routes([web.get("/", health_check)])
+    webapp.add_routes([web.get("/", lambda request: web.Response(text="OK"))])
     runner = web.AppRunner(webapp)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     logger.info(f"Starting keep-alive web server on port {PORT}")
     await site.start()
 
-# --- Main Entrypoint ---
-async def main():
-    """Starts the web server and the Pyrogram polling client together."""
-    if not all([BOT_TOKEN, API_ID, API_HASH]):
-        logger.critical("One or more critical environment variables are missing!")
-        return
-    
-    # asyncio.gather runs both tasks concurrently.
-    await asyncio.gather(
-        start_web_server(),
-        app.run()  # app.run() with no arguments starts the polling client.
-    )
+    logger.info("Bot is running!")
+    # This keeps the script running indefinitely.
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    logger.info("Starting bot...")
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped.")
-
+        
