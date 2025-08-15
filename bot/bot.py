@@ -6,95 +6,94 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from dotenv import load_dotenv
 from worker.tasks import encode_video_task
 
-# Load environment variables
+# Load .env
 load_dotenv()
 
-# Set up logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# Logging setup
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# --- CONFIGURATION ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-APP_URL = os.environ.get("APP_URL")
-PORT = int(os.environ.get("PORT", 8443))
+# Explicit configs
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+APP_URL = os.getenv("APP_URL", "").strip()
+PORT = int(os.getenv("PORT", "8443"))
 
 try:
-    ADMIN_USER_IDS = [int(user_id.strip()) for user_id in os.environ.get("ADMIN_USER_IDS", "").split(',')]
-except (ValueError, AttributeError):
-    logger.error("ADMIN_USER_IDS is not set correctly. Please provide a comma-separated list of numbers.")
+    ADMIN_USER_IDS = [int(uid.strip()) for uid in os.getenv("ADMIN_USER_IDS", "").split(",") if uid.strip()]
+except ValueError:
+    logger.error("ADMIN_USER_IDS must be a comma-separated list of integers.")
     ADMIN_USER_IDS = []
 
 UNAUTHORIZED_MESSAGE = (
     "👋 Welcome to the **Video Encoder Bot**!\n\n"
-    "This is a private service, and your User ID is not on the authorized list. "
-    "If you believe you should have access, please contact the bot administrator."
+    "This is a private service, and your User ID is not authorized."
 )
 
-# --- Command Handlers ---
+# --- Handlers ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in ADMIN_USER_IDS:
-        await update.message.reply_text("👋 Hello! I'm your friendly encoding bot. Send me a video file to get started.")
+        await update.message.reply_text("👋 Hello! Send me a video to encode.")
     else:
-        await update.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode='Markdown')
-    logger.info(f"User {user_id} ({update.effective_user.username}) used /start.")
+        await update.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode="Markdown")
+    logger.info(f"/start from {user_id} ({update.effective_user.username})")
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
-        await update.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode='Markdown')
+        await update.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode="Markdown")
         return
 
     video_file = update.message.document or update.message.video
     if not video_file:
-        await update.message.reply_text("🤔 That doesn't look like a video file. Please send a video or document.")
+        await update.message.reply_text("🤔 Please send a video file.")
         return
 
+    safe_filename = (video_file.file_name or "video").replace("_", "\\_")  # Escape underscores for Markdown
+
     keyboard = [
-        [InlineKeyboardButton("✅ 720p (Default)", callback_data=f"encode_720_{video_file.file_id}")],
-        [InlineKeyboardButton("🚀 1080p", callback_data=f"encode_1080_{video_file.file_id}"),
-         InlineKeyboardButton("💾 480p", callback_data=f"encode_480_{video_file.file_id}")],
+        [InlineKeyboardButton("✅ 720p (Default)", callback_data=f"encode|720|{video_file.file_id}")],
+        [InlineKeyboardButton("🚀 1080p", callback_data=f"encode|1080|{video_file.file_id}"),
+         InlineKeyboardButton("💾 480p", callback_data=f"encode|480|{video_file.file_id}")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        f"🎬 Received file: `{video_file.file_name}`\n\nPlease choose an output quality:",
+        f"🎬 Received file: `{safe_filename}`\n\nPlease choose an output quality:",
         reply_markup=reply_markup,
-        parse_mode='Markdown'
+        parse_mode="Markdown"
     )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    action, quality, file_id = query.data.split('_')
+
+    try:
+        action, quality, file_id = query.data.split("|", 2)
+    except ValueError:
+        await query.edit_message_text("❌ Invalid selection data.")
+        return
+
     if action == "encode":
-        await query.edit_message_text(text=f"✅ Great! Queueing file for a {quality}p encode. I'll let you know when it's done!")
-        logger.info(f"Sending job to Celery: user={query.from_user.id}, file_id={file_id}, quality={quality}")
+        await query.edit_message_text(f"✅ Queueing for {quality}p encoding...")
+        logger.info(f"Celery job: user={query.from_user.id}, quality={quality}")
         encode_video_task.delay(user_id=query.from_user.id, file_id=file_id, quality=quality)
 
-# --- Main Application ---
-
+# --- Main startup ---
 async def main():
-    """Starts the bot."""
-    # This check ensures we don't start without critical configs.
-    if not BOT_TOKEN:
-        logger.critical("BOT_TOKEN environment variable is not set! Exiting.")
-        return
-    if not APP_URL:
-        logger.critical("APP_URL environment variable is not set! Exiting.")
+    if not BOT_TOKEN or not APP_URL:
+        logger.critical("Missing BOT_TOKEN or APP_URL.")
         return
 
-    # Build the application object.
     application = Application.builder().token(BOT_TOKEN).build()
-
-    # Register all our command and message handlers.
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(MessageHandler(filters.Document.VIDEO | filters.VIDEO, handle_video))
+    application.add_handler(MessageHandler(filters.VIDEO | filters.Document.MimeType("video/"), handle_video))
     application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # This is the single, all-in-one command to start the webhook bot.
-    # It handles initialization, setting the webhook, starting the server, and graceful shutdown.
+
     await application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
@@ -102,7 +101,12 @@ async def main():
         webhook_url=f"{APP_URL}/{BOT_TOKEN}"
     )
 
-if __name__ == '__main__':
-    # This is the standard, correct way to start an asyncio program.
-    asyncio.run(main())
-    
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        # Fix for "asyncio.run() cannot be called from a running event loop"
+        logger.warning(f"Runtime loop conflict: {e}, using alternative runner.")
+        import nest_asyncio
+        nest_asyncio.apply()
+        asyncio.get_event_loop().run_until_complete(main())
