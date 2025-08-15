@@ -25,8 +25,10 @@ logger = logging.getLogger(__name__)
 
 # ------- Explicit configuration -------
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-APP_URL = (os.getenv("APP_URL") or "").strip()  # must be public HTTPS
+APP_URL = (os.getenv("APP_URL") or "").strip()
 PORT = int(os.getenv("PORT", "8443"))
+# A list of common video file extensions for fallback checking
+VIDEO_EXTENSIONS = (".mkv", ".mp4", ".webm", ".avi", ".mov", ".flv", ".wmv")
 
 try:
     ADMIN_USER_IDS = [
@@ -44,9 +46,8 @@ UNAUTHORIZED_MESSAGE = (
     "If you believe you should have access, please contact the bot administrator."
 )
 
-# ------- Validation (fail fast, clear logs) -------
+# ------- Validation -------
 def _validate_config() -> None:
-    """Ensures all critical environment variables are set and valid."""
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set.")
     if not APP_URL:
@@ -70,23 +71,38 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode="Markdown")
     logger.info("User %s (%s) used /start.", user_id, update.effective_user.username)
 
-
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.info("File handler triggered for user %s.", user_id) # <-- ADDED LOGGING
+
     if user_id not in ADMIN_USER_IDS:
         await update.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode="Markdown")
         return
 
     video_file = update.message.document or update.message.video
     if not video_file:
+        # This should ideally not be reached if the filter is correct
+        logger.warning("handle_video triggered but no video or document found.")
+        return
+
+    file_name = getattr(video_file, "file_name", "unknown_file")
+    mime_type = getattr(video_file, "mime_type", "unknown_mime")
+    logger.info("Received file. Name: '%s', MIME Type: '%s'", file_name, mime_type) # <-- ADDED LOGGING
+
+    # This is our new, more robust check for a valid video file
+    is_video = (
+        mime_type.startswith("video/") or
+        file_name.lower().endswith(VIDEO_EXTENSIONS)
+    )
+
+    if not is_video:
+        logger.info("File '%s' is not a video. Replying to user.", file_name) # <-- ADDED LOGGING
         await update.message.reply_text(
-            "🤔 That doesn't look like a video file. Please send a video or document."
+            "🤔 This doesn't look like a video file I can process. Please send a file like .mkv, .mp4, etc."
         )
         return
 
-    safe_name = (getattr(video_file, "file_name", None) or "video").replace("_", "\\_")
-
-    # Use '|' as a separator to avoid conflicts with file_ids containing underscores.
+    safe_name = file_name.replace("_", "\\_")
     keyboard = [
         [
             InlineKeyboardButton(
@@ -135,26 +151,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id=query.from_user.id, file_id=file_id, quality=quality
         )
 
-# ------- App factory for clean separation -------
+# ------- App factory -------
 def build_app() -> Application:
-    """Builds the Telegram Application object and registers handlers."""
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
+    # This filter is now broader to catch all documents and videos.
     application.add_handler(
-        MessageHandler(
-            filters.VIDEO | filters.Document.MimeType("video/"), handle_video
-        )
+        MessageHandler(filters.VIDEO | filters.Document.ALL, handle_video)
     )
     application.add_handler(CallbackQueryHandler(button_callback))
     return application
 
 # ------- Entrypoint -------
 def main() -> None:
-    """Validates config, creates the event loop, and runs the bot."""
     _validate_config()
 
-    # This is a robust way to ensure an event loop exists.
     try:
         asyncio.get_event_loop()
     except RuntimeError:
@@ -163,7 +175,6 @@ def main() -> None:
 
     app = build_app()
 
-    # This is a blocking call that correctly runs the webhook bot.
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
