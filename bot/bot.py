@@ -9,6 +9,8 @@ from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+# This is the crucial, correct import for the raw API function
+from pyrogram.raw.functions.bots import SetBotWebhook
 from worker.tasks import encode_video_task
 
 # --- Configuration ---
@@ -27,9 +29,8 @@ app = Client("encoder_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HAS
 
 # --- Constants ---
 UNAUTHORIZED_MESSAGE = "👋 Welcome!\nThis is a private bot and you are not authorized to use it."
-VIDEO_EXTENSIONS = (".mkv", ".mp4", ".webm", ".avi", ".mov")
 
-# --- Handlers (These are the same as before) ---
+# --- Handlers (These are correct and do not need changes) ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
     if message.from_user.id in ADMIN_USER_IDS:
@@ -71,51 +72,48 @@ async def button_callback(client, callback_query):
 
 # --- aiohttp Web Server for Heroku ---
 async def webhook_handler(request: web.Request):
-    """This is the entry point for all updates from Telegram."""
-    # The client is retrieved from the webapp's context
     client = request.app["client"]
     try:
-        # This is the crucial line: we feed the raw update into Pyrogram
         await client.feed_update(await request.json())
     except Exception as e:
         logger.error("Could not feed update to Pyrogram: %s", e)
     finally:
-        # We must return a 200 OK to Telegram, otherwise it will keep resending the update.
         return web.Response(status=200)
 
-async def start_bot_and_server():
-    """Starts the Pyrogram client and the web server together."""
+async def main():
     if not all([BOT_TOKEN, API_ID, API_HASH, APP_URL]):
         logger.critical("One or more critical environment variables are missing!")
         return
 
-    # aiohttp Application Setup
     webapp = web.Application()
     webapp.add_routes([web.post(f"/{BOT_TOKEN}", webhook_handler)])
-    
-    # Store the Pyrogram client in the webapp's context to make it accessible in the handler
     webapp["client"] = app
 
     runner = web.AppRunner(webapp)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     
-    # Start the Pyrogram client and the web server
     await app.start()
-    await site.start()
     
-    # Set the webhook to point to our new server
+    # This is the final, correct way to set the webhook.
     webhook_url = f"{APP_URL}/{BOT_TOKEN}"
-    await app.set_webhook(url=webhook_url)
+    await app.invoke(
+        SetBotWebhook(
+            url=webhook_url,
+            max_connections=40  # A sensible default
+        )
+    )
     logger.info(f"Webhook set to {webhook_url}")
     
     logger.info(f"Web server started on port {PORT}")
-    await asyncio.Event().wait() # Keep the application running indefinitely
+    await site.start()
+    
+    await asyncio.Event().wait()
 
 # --- Main Entrypoint ---
 if __name__ == "__main__":
     try:
-        asyncio.run(start_bot_and_server())
+        asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped.")
         
