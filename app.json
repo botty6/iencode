@@ -1,0 +1,49 @@
+{
+  "name": "Telegram Encoder Bot",
+  "description": "A powerful video encoding bot using Python, Celery, and FFmpeg.",
+  "repository": "https://github.com/YOUR_USERNAME/YOUR_REPOSITORY",
+  "logo": "https://i.imgur.com/8rq4sJt.png",
+  "keywords": ["python", "telegram", "bot", "ffmpeg", "celery", "video"],
+  "stack": "heroku-22",
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    },
+    {
+      "url": "https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest.git"
+    }
+  ],
+  "addons": [
+    {
+      "plan": "heroku-redis:basic-0",
+      "as": "REDIS"
+    }
+  ],
+  "env": {
+    "BOT_TOKEN": {
+      "description": "Your Telegram Bot API token from @BotFather.",
+      "value": "",
+      "required": true
+    },
+    "ADMIN_USER_IDS": {
+      "description": "Comma-separated list of Telegram User IDs who are authorized to use the bot.",
+      "value": "",
+      "required": true
+    },
+    "BRANDING_TEXT": {
+      "description": "The branding suffix to add to filenames and metadata.",
+      "value": "MyEnc",
+      "required": false
+    }
+  },
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "basic"
+    },
+    "worker": {
+      "quantity": 1,
+      "size": "basic"
+    }
+  }
+}
