@@ -1,6 +1,6 @@
 import os
 import logging
-import asyncio
+import asyncio # <-- 1. IMPORT ASYNCIO
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from dotenv import load_dotenv
@@ -72,7 +72,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "encode":
         # Let the user know the job has started
-        await query.edit_message_text(text=f"✅ Great! Queueing `{file_id}` for a {quality}p encode. I'll let you know when it's done!")
+        await query.edit_message_text(text=f"✅ Great! Queueing file for a {quality}p encode. I'll let you know when it's done!")
 
         # Send the task to the Celery worker
         logger.info(f"Sending job to Celery: user={query.from_user.id}, file_id={file_id}, quality={quality}")
@@ -84,7 +84,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Main Application ---
 
-def main():
+async def main(): # <-- 2. MAKE MAIN ASYNC
     """Starts the bot."""
     if not BOT_TOKEN:
         logger.critical("BOT_TOKEN environment variable is not set! Exiting.")
@@ -100,8 +100,12 @@ def main():
     application.add_handler(CallbackQueryHandler(button_callback))
 
     logger.info("Bot is starting up...")
-    application.run_polling()
+    
+    # This runs the bot until you press Ctrl-C
+    # It will also set up the asyncio event loop correctly
+    await application.run_polling()
 
 if __name__ == '__main__':
-    main()
-  
+    # 3. RUN MAIN USING ASYNCIO.RUN()
+    asyncio.run(main())
+
