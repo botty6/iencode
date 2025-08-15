@@ -1,4 +1,3 @@
-# bot.py
 import os
 import logging
 import asyncio
@@ -20,10 +19,9 @@ from worker.tasks import encode_video_task
 load_dotenv()
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-logger = logging.getLogger("video-encoder-bot")
+logger = logging.getLogger(__name__)
 
 # ------- Explicit configuration -------
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
@@ -48,6 +46,7 @@ UNAUTHORIZED_MESSAGE = (
 
 # ------- Validation (fail fast, clear logs) -------
 def _validate_config() -> None:
+    """Ensures all critical environment variables are set and valid."""
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set.")
     if not APP_URL:
@@ -71,6 +70,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(UNAUTHORIZED_MESSAGE, parse_mode="Markdown")
     logger.info("User %s (%s) used /start.", user_id, update.effective_user.username)
 
+
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
@@ -84,15 +84,22 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Escape underscores for legacy Markdown; keep simple and safe
     safe_name = (getattr(video_file, "file_name", None) or "video").replace("_", "\\_")
 
-    # Use '|' so underscores inside IDs don't break parsing
+    # Use '|' as a separator to avoid conflicts with file_ids containing underscores.
     keyboard = [
-        [InlineKeyboardButton("✅ 720p (Default)", callback_data=f"encode|720|{video_file.file_id}")],
         [
-            InlineKeyboardButton("🚀 1080p", callback_data=f"encode|1080|{video_file.file_id}"),
-            InlineKeyboardButton("💾 480p", callback_data=f"encode|480|{video_file.file_id}"),
+            InlineKeyboardButton(
+                "✅ 720p (Default)", callback_data=f"encode|720|{video_file.file_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🚀 1080p", callback_data=f"encode|1080|{video_file.file_id}"
+            ),
+            InlineKeyboardButton(
+                "💾 480p", callback_data=f"encode|480|{video_file.file_id}"
+            ),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -124,29 +131,30 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_id,
             quality,
         )
-        # Celery task must accept keyword args
-        encode_video_task.delay(user_id=query.from_user.id, file_id=file_id, quality=quality)
+        encode_video_task.delay(
+            user_id=query.from_user.id, file_id=file_id, quality=quality
+        )
 
-# ------- App factory -------
+# ------- App factory for clean separation -------
 def build_app() -> Application:
+    """Builds the Telegram Application object and registers handlers."""
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(
         MessageHandler(
-            # robust: native videos OR documents with video/*
-            filters.VIDEO | filters.Document.MimeType("video/"),
-            handle_video,
+            filters.VIDEO | filters.Document.MimeType("video/"), handle_video
         )
     )
     application.add_handler(CallbackQueryHandler(button_callback))
     return application
 
-# ------- Entrypoint (clean loop setup; no nest_asyncio, no asyncio.run) -------
+# ------- Entrypoint -------
 def main() -> None:
+    """Validates config, creates the event loop, and runs the bot."""
     _validate_config()
 
-    # Ensure a current event loop exists (fixes "no current event loop" on some hosts)
+    # This is a robust way to ensure an event loop exists.
     try:
         asyncio.get_event_loop()
     except RuntimeError:
@@ -155,13 +163,14 @@ def main() -> None:
 
     app = build_app()
 
-    # Blocking call; PTB manages its own asyncio machinery internally.
+    # This is a blocking call that correctly runs the webhook bot.
     app.run_webhook(
-        listen="0.0.0.0",                 # explicit host for Heroku/Docker
-        port=PORT,                        # Heroku provides $PORT
-        url_path=BOT_TOKEN,               # unique path (simple obscurity)
-        webhook_url=f"{APP_URL}/{BOT_TOKEN}",  # full public HTTPS webhook
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_TOKEN,
+        webhook_url=f"{APP_URL}/{BOT_TOKEN}",
     )
 
 if __name__ == "__main__":
     main()
+    
