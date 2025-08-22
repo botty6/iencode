@@ -6,19 +6,57 @@ import os
 
 def get_video_info(input_path: str):
     """
-    Uses ffprobe to get detailed information about a video file.
+    Uses ffprobe to get detailed information about a video file, including a reliable duration.
+    
+    Args:
+        input_path: The path to the video file.
+        
+    Returns:
+        A dictionary containing video stream information and a reliable duration, or None.
     """
-    ffprobe_command = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", input_path]
+    # --- UPDATED: Add -show_format to get container-level metadata ---
+    ffprobe_command = [
+        "ffprobe",
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams",
+        "-show_format", # This is the key change
+        input_path
+    ]
     
     try:
-        result = subprocess.run(ffprobe_command, capture_output=True, text=True, check=True)
+        result = subprocess.run(
+            ffprobe_command,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
         info = json.loads(result.stdout)
         
+        video_stream = None
         for stream in info.get("streams", []):
             if stream.get("codec_type") == "video":
-                return stream
+                video_stream = stream
+                break
                 
-        return None
+        if not video_stream:
+            logging.warning(f"No video stream found in {input_path}")
+            return None
+
+        # --- NEW: Robust duration checking ---
+        # 1. Try to get duration from the video stream first.
+        duration = video_stream.get("duration")
+        
+        # 2. If not in the stream, fall back to the main container format.
+        if not duration:
+            duration = info.get("format", {}).get("duration")
+            
+        # 3. Add the reliable duration to our stream dictionary.
+        video_stream['duration'] = duration
+        
+        return video_stream
+        
     except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
         logging.error(f"Error getting video info for {input_path}: {e}")
         return None
