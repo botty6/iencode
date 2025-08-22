@@ -12,7 +12,7 @@ from kombu import Queue
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 from dotenv import load_dotenv
-from .utils import get_video_info, generate_standard_filename, create_progress_bar, humanbytes
+from .utils import get_video_info, generate_thumbnail, generate_standard_filename, create_progress_bar, humanbytes
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -56,16 +56,18 @@ def download_task(self, user_id: int, status_message_id: int, list_of_message_id
         raise
 
 async def _run_download_and_prep(task_id: str, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict):
-    app = Client(f"dl_{task_id}", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp", workers=WORKERS, in_memory=True)
-    await app.start()
-    
-    status_message = await app.get_messages(user_id, status_message_id)
-    last_update_time = 0
-    
+    # This task no longer uses an active Pyrogram client
     job_cache_dir = os.path.join(DOWNLOAD_CACHE_DIR, task_id)
     os.makedirs(job_cache_dir, exist_ok=True)
     merged_input_path = os.path.join(job_cache_dir, "merged_input.mkv")
 
+    # The actual download logic needs a client, which should be initialized here
+    app = Client(f"dl_{task_id}", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp", workers=WORKERS, in_memory=True)
+    await app.start()
+
+    status_message = await app.get_messages(user_id, status_message_id)
+    last_update_time = 0
+    
     try:
         messages = await app.get_messages(user_id, list_of_message_ids)
         if not isinstance(messages, list): messages = [messages]
@@ -73,10 +75,6 @@ async def _run_download_and_prep(task_id: str, user_id: int, status_message_id: 
         first_message = messages[0]
         file_meta = first_message.video or first_message.document
         original_filename = getattr(file_meta, "file_name", "unknown_file.tmp")
-        
-        fresh_thumbnail_id = None
-        if first_message.video and first_message.video.thumb:
-            fresh_thumbnail_id = first_message.video.thumb.file_id
 
         total_size = sum(getattr(m.video or m.document, "file_size", 0) for m in messages)
         if total_size == 0: raise ValueError("File size is 0 B.")
@@ -103,24 +101,22 @@ async def _run_download_and_prep(task_id: str, user_id: int, status_message_id: 
                             await status_message.edit_text(text)
                         except FloodWait as e:
                             await asyncio.sleep(e.value)
-
-        await status_message.edit_text("🔬 Analyzing downloaded file...")
         
-        custom_thumbnail_id = user_settings.get("custom_thumbnail_id")
-        
-        thumb_path = None
-        final_thumbnail_id = custom_thumbnail_id or fresh_thumbnail_id
-        if final_thumbnail_id:
-            thumb_path = await app.download_media(final_thumbnail_id, file_name=os.path.join(job_cache_dir, "thumb.jpg"))
+        await status_message.edit_text("🔬 Analyzing file and generating thumbnail...")
         
         video_info = get_video_info(merged_input_path)
         if not video_info: raise ValueError("Could not get video info from the downloaded file.")
         
+        # --- REFACTORED THUMBNAIL LOGIC ---
+        thumb_path = generate_thumbnail(merged_input_path, job_cache_dir)
+        
+        # Prepare all necessary data for the next task in the chain
         return {
             "user_id": user_id, "status_message_id": status_message_id,
             "input_path": merged_input_path, "job_cache_dir": job_cache_dir,
             "original_filename": original_filename, "quality": quality,
-            "thumb_path": thumb_path, "video_info": video_info,
+            "thumb_path": thumb_path,  # This will be the path or None
+            "video_info": video_info,
             "user_settings": user_settings
         }
     except Exception as e:
@@ -209,11 +205,8 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
             last_line_of_error = error_message.splitlines()[-1] if error_message else "Unknown FFmpeg error"
             raise RuntimeError(f"FFmpeg error: {last_line_of_error}")
 
-        # --- START: NEW POST-ENCODE VALIDATION ---
-        # Check if the output file exists and is not empty.
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
             raise RuntimeError("Encoding resulted in an empty file. The source video may be corrupt.")
-        # --- END: NEW POST-ENCODE VALIDATION ---
 
         async def upload_progress(current, total):
             nonlocal last_update_time
@@ -228,8 +221,21 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
                     await status_message.edit_text(text)
                 except FloodWait as e:
                     await asyncio.sleep(e.value)
+        
+        # --- FINAL UPLOAD GUARD ---
+        # This guard ensures we only pass the thumb path if it's a valid file.
+        thumb_to_upload = None
+        thumb_path_from_prep = prep_data.get("thumb_path")
+        if thumb_path_from_prep and os.path.exists(thumb_path_from_prep) and os.path.getsize(thumb_path_from_prep) > 0:
+            thumb_to_upload = thumb_path_from_prep
 
-        await app.send_document(user_id, output_path, caption=f"✅ Encode Complete!\n\n`{output_filename}`", thumb=prep_data["thumb_path"], progress=upload_progress)
+        await app.send_document(
+            user_id,
+            output_path,
+            caption=f"✅ Encode Complete!\n\n`{output_filename}`",
+            thumb=thumb_to_upload,  # Use the validated path, or None
+            progress=upload_progress
+        )
         await status_message.delete()
         
     except Exception as e:
