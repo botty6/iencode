@@ -29,6 +29,7 @@ os.makedirs(DOWNLOAD_CACHE_DIR, exist_ok=True)
 
 DEFAULT_BRAND = os.getenv("BRANDING_TEXT", "MyEnc")
 DEFAULT_WEBSITE = os.getenv("BRANDING_WEBSITE", "t.me/YourChannel")
+ENCODE_PRESET = os.getenv("ENCODE_PRESET", "slow")
 ENCODE_CRF = os.getenv("ENCODE_CRF", "24")
 AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 
@@ -53,7 +54,7 @@ async def send_status_update(user_chat_id: int, message_text: str):
         except Exception as e:
             logging.error(f"Failed to send status update to {user_chat_id}: {e}")
 
-async def _run_async_task(task_id: str, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict, preset: str, original_task_id: str = None):
+async def _run_async_task(task_id: str, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict, original_task_id: str = None):
     app = Client("worker_session", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp", workers=WORKERS)
     await app.start()
     
@@ -72,12 +73,16 @@ async def _run_async_task(task_id: str, user_id: int, status_message_id: int, li
         file_meta = first_message.video or first_message.document
         original_filename = getattr(file_meta, "file_name", "unknown_file.tmp")
         
+        total_size = sum(getattr(m.video or m.document, "file_size", 0) for m in messages)
+
+        # --- NEW: Early exit for 0 byte files ---
+        if total_size == 0:
+            raise ValueError("File size equals to 0 B")
+
         if os.path.exists(merged_input_path):
             await status_message.edit_text("✅ Found cached file. Skipping download.")
         else:
             os.makedirs(job_cache_dir, exist_ok=True)
-            total_size = sum(getattr(m.video or m.document, "file_size", 0) for m in messages)
-            
             start_time = time.time()
             current_size = 0
             with open(merged_input_path, "wb") as f:
@@ -132,7 +137,7 @@ async def _run_async_task(task_id: str, user_id: int, status_message_id: int, li
 
         ffmpeg_command = [
             "ffmpeg", "-i", merged_input_path,
-            "-c:v", "libx265", "-preset", preset, "-crf", ENCODE_CRF,
+            "-c:v", "libx265", "-preset", ENCODE_PRESET, "-crf", ENCODE_CRF,
             "-vf", f"scale=-2:{final_quality_str}",
             "-c:a", "aac", "-b:a", AUDIO_BITRATE,
             "-metadata", f"encoder={brand_name}",
@@ -185,18 +190,21 @@ async def _run_async_task(task_id: str, user_id: int, status_message_id: int, li
 
     except (ValueError, RuntimeError) as e:
         await status_message.edit_text(f"💥 A critical, non-retryable error occurred:\n\n`{str(e)}`")
-        raise Ignore()
+        raise Ignore() # This tells Celery to stop and NOT retry.
     finally:
         await app.stop()
         if os.path.exists(job_cache_dir):
             shutil.rmtree(job_cache_dir)
-        remove_job(task_id)
+        # --- REMOVED: The erroneous remove_job(task_id) call ---
 
 @celery_app.task(name="worker.tasks.encode_video_task", bind=True, max_retries=3, default_retry_delay=60)
-def encode_video_task(self, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict, preset: str, original_task_id: str = None):
+def encode_video_task(self, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict, original_task_id: str = None):
     try:
         task_id = self.request.id
-        asyncio.run(_run_async_task(task_id, user_id, status_message_id, list_of_message_ids, quality, original_thumbnail_id, user_settings, preset, original_task_id))
+        asyncio.run(_run_async_task(task_id, user_id, status_message_id, list_of_message_ids, quality, original_thumbnail_id, user_settings, original_task_id))
+    except Ignore:
+        # If our async code raised an Ignore exception, we don't retry.
+        pass
     except Exception as e:
         logging.warning(f"Task {self.request.id} failed. Attempt {self.request.retries + 1}. Retrying... Error: {e}")
         retry_message = (f"⚠️ A temporary error occurred. Retrying... (Attempt {self.request.retries + 1})")
