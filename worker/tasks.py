@@ -48,7 +48,7 @@ async def send_status_update(user_chat_id: int, message_text: str):
         except Exception as e:
             logging.error(f"Failed to send status update to {user_chat_id}: {e}")
 
-async def _run_async_task(user_chat_id: int, status_message_id: int, list_of_message_ids: list, quality: str, thumbnail_file_id: str = None):
+async def _run_async_task(task_id: str, user_chat_id: int, status_message_id: int, list_of_message_ids: list, quality: str, thumbnail_file_id: str = None):
     app = Client("worker_session", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, in_memory=True)
     await app.start()
     
@@ -95,6 +95,9 @@ async def _run_async_task(user_chat_id: int, status_message_id: int, list_of_mes
                 raise ValueError("Could not get video info. File might be corrupt.")
             
             total_duration_sec = float(video_info.get("duration", 0))
+            if total_duration_sec == 0:
+                raise ValueError("Video duration is 0. Cannot calculate encoding progress.")
+
             original_height = int(video_info.get("height", 0))
             target_quality = int(quality)
 
@@ -162,8 +165,6 @@ async def _run_async_task(user_chat_id: int, status_message_id: int, list_of_mes
                 progress=upload_progress
             )
             await status_message.delete()
-            # We can't update the bot's job queue from here directly in a simple way.
-            # A final message is sent instead.
             await app.send_message(user_chat_id, f"🚀 Job for `{output_filename}` finished!")
 
     except (ValueError, RuntimeError) as e:
@@ -180,9 +181,10 @@ async def _run_async_task(user_chat_id: int, status_message_id: int, list_of_mes
 )
 def encode_video_task(self, user_chat_id: int, status_message_id: int, list_of_message_ids: list, quality: str, thumbnail_file_id: str = None):
     try:
-        asyncio.run(_run_async_task(user_chat_id, status_message_id, list_of_message_ids, quality, thumbnail_file_id))
+        task_id = self.request.id
+        asyncio.run(_run_async_task(task_id, user_chat_id, status_message_id, list_of_message_ids, quality, thumbnail_file_id))
     except Exception as e:
-        logging.warning(f"Task failed. Attempt {self.request.retries + 1}. Retrying... Error: {e}")
+        logging.warning(f"Task {self.request.id} failed. Attempt {self.request.retries + 1}. Retrying... Error: {e}")
         retry_message = (f"⚠️ A temporary error occurred. Retrying... (Attempt {self.request.retries + 1})")
         asyncio.run(send_status_update(user_chat_id, retry_message))
         raise self.retry(exc=e)
