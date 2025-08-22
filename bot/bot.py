@@ -34,22 +34,22 @@ user_states = {}
 
 app = Client("encoder_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp")
 
-# --- Helper Functions ---
-async def trigger_encode_job(user_id: int, original_message: Message):
-    await asyncio.sleep(30) 
-    user_data = pending_parts.get(user_id)
-    if not user_data or not user_data["message_ids"]: return
-    await original_message.reply_text( f"✅ Received {len(user_data['message_ids'])} parts. Choose quality:", reply_markup=create_new_job_keyboard(user_id))
-    user_data["timer"] = None
 
-def create_new_job_keyboard(identifier):
+# --- Keyboard Helper Functions ---
+def create_quality_keyboard(identifier):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ 720p (Standard)", callback_data=f"encode|720|{identifier}|default")],
-        [
-            InlineKeyboardButton("🚀 1080p (Standard)", callback_data=f"encode|1080|{identifier}|default"),
-            InlineKeyboardButton("💾 480p (Standard)", callback_data=f"encode|480|{identifier}|default"),
-        ]
+        [InlineKeyboardButton("💎 1080p (Full HD)", callback_data=f"quality|1080|{identifier}")],
+        [InlineKeyboardButton("✅ 720p (Standard)", callback_data=f"quality|720|{identifier}")],
+        [InlineKeyboardButton("💾 480p (Basic)", callback_data=f"quality|480|{identifier}")]
     ])
+
+def create_preset_keyboard(quality, identifier):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Fast (Good)", callback_data=f"encode|{quality}|fast|{identifier}")],
+        [InlineKeyboardButton(" balanced Medium (Great)", callback_data=f"encode|{quality}|medium|{identifier}")],
+        [InlineKeyboardButton("🐌 Slow (Best)", callback_data=f"encode|{quality}|slow|{identifier}")]
+    ])
+
 
 # --- Main Command Handlers ---
 @app.on_message(filters.command("start") & filters.private)
@@ -74,7 +74,8 @@ async def queue_command(client, message):
     for i, job in enumerate(jobs):
         job_text = f"{i+1}️⃣ `{job['filename']}` → **{job['status']}**"
         buttons = []
-        if "Pending in default" in job.get('status', ''):
+        # Only show accelerate if the job is in the default queue
+        if job.get('job_data', {}).get('cpu_queue') == 'default':
             buttons.append(InlineKeyboardButton(f"⚡️ Accelerate", callback_data=f"accelerate|{job['task_id']}"))
         
         buttons.append(InlineKeyboardButton(f"❌ Cancel", callback_data=f"cancel|{job['task_id']}"))
@@ -84,6 +85,7 @@ async def queue_command(client, message):
     
     await message.reply_text(queue_text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
 
+# ... (settings and cancel commands are the same as before)
 @app.on_message(filters.command("settings") & filters.private)
 async def settings_command(client, message):
     user_id = message.from_user.id
@@ -110,6 +112,20 @@ async def cancel_command(client, message):
     if user_id in user_states:
         del user_states[user_id]
         await message.reply_text("Action canceled.")
+        
+# --- Main File Handling Logic ---
+
+async def trigger_encode_job(user_id: int, original_message: Message):
+    """Called by a timer to present the quality options for multi-part files."""
+    await asyncio.sleep(30) 
+    user_data = pending_parts.get(user_id)
+    if not user_data or not user_data["message_ids"]: return
+    
+    await original_message.reply_text(
+        f"✅ Received {len(user_data['message_ids'])} parts. **Step 1: Choose Quality**",
+        reply_markup=create_quality_keyboard(user_id)
+    )
+    user_data["timer"] = None
 
 @app.on_message((filters.video | filters.document | filters.photo) & filters.private)
 async def main_file_handler(client, message: Message):
@@ -126,100 +142,158 @@ async def main_file_handler(client, message: Message):
         return
     
     if message.video or message.document:
-        await handle_video(client, message)
+        file = message.video or message.document
+        file_name = getattr(file, "file_name", "unknown_file.tmp")
+        
+        is_split_file = re.search(r'\.(part\d+|\d{3})$', file_name, re.IGNORECASE)
+        if is_split_file:
+            user_data = pending_parts[user_id]
+            if user_data["timer"]: user_data["timer"].cancel()
+            user_data["message_ids"].append(message.id)
+            await message.reply_text(f"👍 Part `{file_name}` collected. Total: {len(user_data['message_ids'])}.", quote=True)
+            user_data["timer"] = asyncio.create_task(trigger_encode_job(user_id, message))
+        else:
+            await message.reply_text(
+                f"🎬 Received: `{file_name}`\n\n**Step 1: Choose Quality**",
+                reply_markup=create_quality_keyboard(message.id)
+            )
 
-async def handle_video(client, message: Message):
-    user_id = message.from_user.id
-    file = message.video or message.document
-    file_name = getattr(file, "file_name", "unknown_file.tmp")
-    is_split_file = re.search(r'\.(part\d+|\d{3})$', file_name, re.IGNORECASE)
-    if is_split_file:
-        user_data = pending_parts[user_id]
-        if user_data["timer"]: user_data["timer"].cancel()
-        user_data["message_ids"].append(message.id)
-        await message.reply_text(f"👍 Part `{file_name}` collected. Total: {len(user_data['message_ids'])}.", quote=True)
-        user_data["timer"] = asyncio.create_task(trigger_encode_job(user_id, message))
-    else:
-        await message.reply_text(f"🎬 Received: `{file_name}`\nPlease choose quality:", reply_markup=create_new_job_keyboard(message.id))
 
+# --- Callback Query Handlers ---
 
-@app.on_callback_query(filters.regex(r"^(encode|accelerate|cancel|set_setting)"))
+def start_encode_pipeline(job_data: dict):
+    """Helper function to create and apply the Celery task chain."""
+    pipeline = chain(
+        download_task.s(
+            user_id=job_data['user_id'],
+            status_message_id=job_data['status_message_id'],
+            list_of_message_ids=job_data['message_ids'],
+            quality=job_data['quality'],
+            preset=job_data['preset'],
+            user_settings=job_data['user_settings']
+        ).set(queue='io_queue'),
+        encode_task.s().set(queue=job_data['cpu_queue'])
+    )
+    return pipeline.apply_async()
+
+@app.on_callback_query(filters.regex(r"^(quality|encode|accelerate|cancel|set_setting)"))
 async def callback_router(client, callback_query: CallbackQuery):
     action = callback_query.data.split("|")[0]
-    if action == "encode":
-        await button_callback(client, callback_query)
-    elif action == "accelerate":
-        await accelerate_callback(client, callback_query)
-    elif action == "cancel":
-        await cancel_callback(client, callback_query)
-    elif action == "set_setting":
-        await set_setting_callback(client, callback_query)
-
-async def button_callback(client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    action, quality, identifier, cpu_queue_type = callback_query.data.split("|", 3)
     
-    message_ids, original_filename, thumbnail_file_id = [], "unknown.tmp", None
-    try:
-        if identifier.isdigit(): message_ids = [int(identifier)]
-        else:
-            user_data = pending_parts.get(int(identifier))
-            if user_data: message_ids = sorted(user_data["message_ids"])
-        
-        if not message_ids: raise ValueError("Message IDs list is empty.")
+    handlers = {
+        "quality": quality_callback,
+        "encode": encode_callback,
+        "accelerate": accelerate_callback,
+        "cancel": cancel_callback,
+        "set_setting": set_setting_callback
+    }
+    
+    handler = handlers.get(action)
+    if handler:
+        await handler(client, callback_query)
 
-        first_message = await client.get_messages(user_id, message_ids[0])
-        file_meta = first_message.video or first_message.document
-        original_filename = getattr(file_meta, "file_name", "unknown.tmp")
-        if first_message.video and first_message.video.thumb:
-            thumbnail_file_id = first_message.video.thumb.file_id
-    except Exception as e:
-        logger.error(f"Error getting file info: {e}")
-        await callback_query.answer(f"Error getting file info.", show_alert=True)
+async def quality_callback(client, callback_query: CallbackQuery):
+    action, quality, identifier = callback_query.data.split("|")
+    await callback_query.message.edit_text(
+        f"✅ Quality set to **{quality}p**.\n\n**Step 2: Choose Encode Preset**",
+        reply_markup=create_preset_keyboard(quality, identifier)
+    )
+
+async def encode_callback(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    try:
+        action, quality, preset, identifier = callback_query.data.split("|", 3)
+    except ValueError:
+        await callback_query.answer("Error: Invalid callback data.", show_alert=True)
         return
 
-    user_settings = get_user_settings(user_id)
-    status_message = await callback_query.message.edit_text(f"✅ Job accepted, starting download...")
+    message_ids = []
+    try:
+        if identifier.isdigit():
+            message_ids = [int(identifier)]
+        else:
+            user_data = pending_parts.get(int(identifier))
+            if user_data:
+                message_ids = sorted(user_data["message_ids"])
+        
+        if not message_ids:
+            raise ValueError("Message IDs list is empty. The job may have timed out.")
+
+        first_message = await client.get_messages(user_id, message_ids[0])
+        original_filename = getattr(first_message.video or first_message.document, "file_name", "unknown.tmp")
+            
+    except Exception as e:
+        logger.error(f"Error preparing job info: {e}")
+        await callback_query.message.edit_text(f"💥 **Error:** Could not retrieve file information. Please try again.")
+        return
+
+    status_message = await callback_query.message.edit_text(f"✅ Job for `{original_filename}` has been queued!")
+
+    job_data = {
+        "user_id": user_id,
+        "status_message_id": status_message.id,
+        "message_ids": message_ids,
+        "quality": quality,
+        "preset": preset,
+        "cpu_queue": "default", # All new jobs start in the default queue
+        "user_settings": get_user_settings(user_id)
+    }
     
-    # Create the task chain
-    pipeline = chain(
-        download_task.s(user_id, status_message.id, message_ids, quality, thumbnail_file_id, user_settings).set(queue='io_queue'),
-        encode_task.s().set(queue=cpu_queue_type)
-    )
+    result = start_encode_pipeline(job_data)
+    add_job(result.id, user_id, original_filename, status_message.id, job_data)
     
-    result = pipeline.apply_async()
-    
-    # Store the job using the ID of the first task in the chain
-    first_task_id = result.id
-    add_job(first_task_id, user_id, original_filename, f"🕒 Pending in {cpu_queue_type}", status_message.id, None)
+    if not identifier.isdigit():
+        del pending_parts[int(identifier)]
 
 
 async def accelerate_callback(client, callback_query: CallbackQuery):
-    # This feature is complex with the new chain model and would require significant
-    # logic to safely stop the I/O task and re-route the chain.
-    # For now, we inform the user it's a future enhancement.
-    await callback_query.answer("Live acceleration for the new pipeline is a future feature.", show_alert=True)
+    """Reliably accelerates a job by cancelling and requeuing it."""
+    await callback_query.answer("⚡️ Accelerating job...", show_alert=False)
+    user_id = callback_query.from_user.id
+    action, task_id = callback_query.data.split("|", 1)
+
+    job = get_job(task_id)
+    if not job or job['user_id'] != user_id:
+        await callback_query.message.edit_text("Could not find this job or you don't own it.")
+        return
+
+    # 1. Revoke the old task to prevent it from running
+    celery_producer.control.revoke(task_id, terminate=False) # Soft revoke
+
+    # 2. Update job data for the high priority queue
+    job_data = job['job_data']
+    job_data['cpu_queue'] = 'high_priority'
+
+    # 3. Start a new pipeline with the updated data
+    new_result = start_encode_pipeline(job_data)
+    
+    # 4. Remove the old job and add the new one
+    remove_job(task_id)
+    add_job(new_result.id, user_id, job['filename'], job['status_message_id'], job_data)
+
+    await callback_query.message.edit_text("✅ Job has been moved to the high-priority accelerator queue!")
 
 
 async def cancel_callback(client, callback_query: CallbackQuery):
+    """Reliably cancels a job."""
+    await callback_query.answer("❌ Cancelling job...", show_alert=False)
     user_id = callback_query.from_user.id
-    action, task_id_to_cancel = callback_query.data.split("|", 1)
-    
-    job_to_cancel = get_job(task_id_to_cancel)
-    if not job_to_cancel:
-        await callback_query.answer("Could not find this job.", show_alert=True)
-        return
-    
-    # Revoke the parent task of the chain. This should prevent the next task from running.
-    celery_producer.control.revoke(task_id_to_cancel, terminate=True, signal='SIGKILL')
-    # Also attempt to revoke the result of the chain, which might hold the second task
-    celery_producer.control.revoke(celery_producer.AsyncResult(task_id_to_cancel).parent.id, terminate=True, signal='SIGKILL')
+    action, task_id = callback_query.data.split("|", 1)
 
-    remove_job(task_id_to_cancel)
+    job = get_job(task_id)
+    if not job or job['user_id'] != user_id:
+        await callback_query.message.edit_text("Could not find this job or you don't own it.")
+        return
+        
+    # 1. Revoke the task from Celery
+    celery_producer.control.revoke(task_id, terminate=True, signal='SIGKILL')
     
-    await callback_query.message.edit_text(f"✅ Job for `{job_to_cancel['filename']}` has been cancelled.")
+    # 2. Update the status in the database
+    update_job_status(task_id, "CANCELLED")
+    
+    await callback_query.message.edit_text(f"✅ Job for `{job['filename']}` has been cancelled.")
     try:
-        await client.edit_message_text(user_id, job_to_cancel['status_message_id'], "❌ Job Cancelled by User.")
+        await client.edit_message_text(user_id, job['status_message_id'], "❌ Job Cancelled by User.")
     except Exception as e:
         logger.warning(f"Could not edit original status message: {e}")
 
@@ -242,12 +316,13 @@ async def handle_settings_text(client, message):
     state = user_states.get(user_id)
     if state in ["brand_name", "website"]:
         update_user_setting(user_id, state, message.text)
-        await message.reply_text(f"✅ `{state.replace('_', ' ').title()}` updated.")
+        await message.reply_text(f"✅ `{state.replace('_', ' ').title()}` updated successfully.")
         del user_states[user_id]
-        
+
 if __name__ == "__main__":
     if not all([BOT_TOKEN, API_ID, API_HASH, ADMIN_USER_IDS]):
-        logger.critical("CRITICAL: One or more environment variables are missing!")
+        logger.critical("CRITICAL: One or more required environment variables are missing!")
     else:
         logger.info("Bot is starting...")
         app.run()
+        
