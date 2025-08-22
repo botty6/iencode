@@ -59,17 +59,25 @@ async def _run_async_task(task_id: str, user_chat_id: int, status_message_id: in
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            first_message = await app.get_messages(user_chat_id, list_of_message_ids[0])
+            # --- CRITICAL FIX: Fetch all Message objects first ---
+            messages = await app.get_messages(user_chat_id, list_of_message_ids)
+            if not isinstance(messages, list): # Ensure messages is always a list
+                messages = [messages]
+
+            first_message = messages[0]
             file_meta = first_message.video or first_message.document
             original_filename = getattr(file_meta, "file_name", "unknown_file.tmp")
-            total_size = getattr(file_meta, "file_size", 0)
+            
+            # For multi-part, sum the sizes. For single, this is just the total size.
+            total_size = sum(getattr(m.video or m.document, "file_size", 0) for m in messages)
 
             merged_input_path = os.path.join(temp_dir, "merged_input.tmp")
             
             current_size = 0
             with open(merged_input_path, "wb") as f:
-                for msg_id in list_of_message_ids:
-                    async for chunk in app.stream_media(msg_id):
+                # --- CORRECTED LOOP: Iterate through Message objects, not IDs ---
+                for message in messages:
+                    async for chunk in app.stream_media(message):
                         f.write(chunk)
                         current_size += len(chunk)
                         
