@@ -12,7 +12,7 @@ from pyrogram.types import (
     InlineKeyboardMarkup,
 )
 from database import get_user_settings, update_user_setting, add_job, get_job, remove_job, get_user_jobs, update_job_status
-from worker.tasks import download_task, encode_task # Import the specific tasks
+from worker.tasks import download_task, encode_task
 
 # --- Configuration & Initializations ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -157,7 +157,7 @@ async def callback_router(client, callback_query: CallbackQuery):
 
 async def button_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
-    action, quality, identifier, queue_type = callback_query.data.split("|", 3)
+    action, quality, identifier, cpu_queue_type = callback_query.data.split("|", 3)
     
     message_ids, original_filename, thumbnail_file_id = [], "unknown.tmp", None
     try:
@@ -179,25 +179,26 @@ async def button_callback(client, callback_query: CallbackQuery):
         return
 
     user_settings = get_user_settings(user_id)
-    status_message = await callback_query.message.edit_text(f"✅ Job accepted, creating processing pipeline...")
+    status_message = await callback_query.message.edit_text(f"✅ Job accepted, starting download...")
     
     # Create the task chain
-    encode_pipeline = chain(
+    pipeline = chain(
         download_task.s(user_id, status_message.id, message_ids, quality, thumbnail_file_id, user_settings).set(queue='io_queue'),
-        encode_task.s().set(queue=f'cpu.{queue_type}') # Note: We need a way for encode_task to know its own final task_id
+        encode_task.s().set(queue=cpu_queue_type)
     )
     
-    pipeline_result = encode_pipeline.apply_async()
+    result = pipeline.apply_async()
     
     # Store the job using the ID of the first task in the chain
-    first_task_id = pipeline_result.id
-    add_job(first_task_id, user_id, original_filename, f"🕒 Pending Download", status_message.id, (user_id, status_message.id, message_ids, quality, thumbnail_file_id, user_settings))
+    first_task_id = result.id
+    add_job(first_task_id, user_id, original_filename, f"🕒 Pending in {cpu_queue_type}", status_message.id, None)
 
 
 async def accelerate_callback(client, callback_query: CallbackQuery):
-    # This logic would need to be more complex, involving checking the state of the first task
-    # and potentially creating a new chain. For now, we keep the simpler model.
-    await callback_query.answer("Acceleration for the new pipeline model is under development.", show_alert=True)
+    # This feature is complex with the new chain model and would require significant
+    # logic to safely stop the I/O task and re-route the chain.
+    # For now, we inform the user it's a future enhancement.
+    await callback_query.answer("Live acceleration for the new pipeline is a future feature.", show_alert=True)
 
 
 async def cancel_callback(client, callback_query: CallbackQuery):
@@ -209,10 +210,11 @@ async def cancel_callback(client, callback_query: CallbackQuery):
         await callback_query.answer("Could not find this job.", show_alert=True)
         return
     
-    # This will revoke the entire chain if the first task hasn't finished
-    celery_producer.control.revoke(task_id_to_cancel, terminate=True)
-    # Also attempt to revoke the second task if its ID were known
-    
+    # Revoke the parent task of the chain. This should prevent the next task from running.
+    celery_producer.control.revoke(task_id_to_cancel, terminate=True, signal='SIGKILL')
+    # Also attempt to revoke the result of the chain, which might hold the second task
+    celery_producer.control.revoke(celery_producer.AsyncResult(task_id_to_cancel).parent.id, terminate=True, signal='SIGKILL')
+
     remove_job(task_id_to_cancel)
     
     await callback_query.message.edit_text(f"✅ Job for `{job_to_cancel['filename']}` has been cancelled.")
