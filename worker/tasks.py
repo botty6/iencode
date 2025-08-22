@@ -28,22 +28,22 @@ if REDIS_URL.startswith("rediss://"):
     REDIS_URL = f"{REDIS_URL}?ssl_cert_reqs=CERT_NONE"
 celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
 
-async def _run_async_task(user_chat_id: int, list_of_message_ids: list, quality: str):
+# --- UPDATED: Task now accepts thumbnail_file_id ---
+async def _run_async_task(user_chat_id: int, list_of_message_ids: list, quality: str, thumbnail_file_id: str = None):
     app = Client("worker_session", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, in_memory=True)
     
     await app.start()
     
     status_message = await app.send_message(user_chat_id, "⚙️ Job started. Preparing to download files...")
     original_filename = "unknown_file.tmp"
+    thumb_path = None
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            # --- NEW: Download and Merge Logic ---
             first_message = await app.get_messages(user_chat_id, list_of_message_ids[0])
             file_meta = first_message.video or first_message.document
             original_filename = getattr(file_meta, "file_name", "unknown_file.tmp")
             
-            # This will be the final, merged input file for ffmpeg
             merged_input_path = os.path.join(temp_dir, "merged_input.tmp")
             
             if len(list_of_message_ids) > 1:
@@ -57,8 +57,6 @@ async def _run_async_task(user_chat_id: int, list_of_message_ids: list, quality:
                 
                 await status_message.edit_text("✅ All parts downloaded! Merging files...")
                 
-                # Use 'cat' command to merge binary files. Simple and effective.
-                # We sort the downloaded parts to ensure they are in the correct order.
                 part_files = sorted(glob.glob(os.path.join(parts_dir, "part_*")))
                 with open(merged_input_path, "wb") as merged_file:
                     for part in part_files:
@@ -67,12 +65,16 @@ async def _run_async_task(user_chat_id: int, list_of_message_ids: list, quality:
                 
                 input_path = merged_input_path
             else:
-                # Single file, download directly
                 await app.download_media(message=first_message, file_name=merged_input_path)
                 input_path = merged_input_path
 
             await status_message.edit_text("🔬 File ready! Analyzing...")
             
+            # --- NEW: Download thumbnail if it exists ---
+            if thumbnail_file_id:
+                logging.info(f"Downloading thumbnail: {thumbnail_file_id}")
+                thumb_path = await app.download_media(thumbnail_file_id, file_name=os.path.join(temp_dir, "thumb.jpg"))
+
             video_info = get_video_info(input_path)
             if not video_info:
                 raise ValueError("Could not get video information from the file. It might be corrupt.")
@@ -90,17 +92,7 @@ async def _run_async_task(user_chat_id: int, list_of_message_ids: list, quality:
 
             await status_message.edit_text(f"✅ Analysis complete! Starting encode for `{output_filename}`...")
             
-            ffmpeg_command = [
-                "ffmpeg", "-i", input_path,
-                "-c:v", "libx265",
-                "-preset", ENCODE_PRESET,
-                "-crf", ENCODE_CRF,
-                "-vf", f"scale=-2:{final_quality_str}",
-                "-c:a", "aac",
-                "-b:a", AUDIO_BITRATE,
-                "-metadata", f"encoder={BRANDING_TEXT}",
-                "-y", output_path
-            ]
+            ffmpeg_command = ["ffmpeg", "-i", input_path, "-c:v", "libx265", "-preset", ENCODE_PRESET, "-crf", ENCODE_CRF, "-vf", f"scale=-2:{final_quality_str}", "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-metadata", f"encoder={BRANDING_TEXT}", "-y", output_path]
             
             process = subprocess.run(ffmpeg_command, capture_output=True, text=True)
 
@@ -111,10 +103,12 @@ async def _run_async_task(user_chat_id: int, list_of_message_ids: list, quality:
 
             await status_message.edit_text(f"Uploading `{output_filename}`...")
             
+            # --- UPDATED: Add the 'thumb' parameter to the upload call ---
             await app.send_document(
                 user_chat_id,
                 output_path,
-                caption=f"✅ Encode Complete!\n\n`{output_filename}`"
+                caption=f"✅ Encode Complete!\n\n`{output_filename}`",
+                thumb=thumb_path # This will be None if no thumb was found
             )
             await status_message.edit_text("🚀 Upload complete! Job finished.")
 
@@ -125,6 +119,7 @@ async def _run_async_task(user_chat_id: int, list_of_message_ids: list, quality:
     finally:
         await app.stop()
 
+# --- UPDATED: Celery task definition to pass the new argument ---
 @celery_app.task(name="worker.tasks.encode_video_task")
-def encode_video_task(user_chat_id: int, list_of_message_ids: list, quality: str):
-    asyncio.run(_run_async_task(user_chat_id, list_of_message_ids, quality))
+def encode_video_task(user_chat_id: int, list_of_message_ids: list, quality: str, thumbnail_file_id: str = None):
+    asyncio.run(_run_async_task(user_chat_id, list_of_message_ids, quality, thumbnail_file_id))
