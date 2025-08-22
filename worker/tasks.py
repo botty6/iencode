@@ -50,7 +50,6 @@ celery_app.conf.task_queues = (
 def download_task(self, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict):
     """Synchronous wrapper for the async download and prep logic."""
     try:
-        # ❗❗❗ THIS IS THE LINE THAT WAS FIXED ❗❗❗
         return asyncio.run(_run_download_and_prep(self.request.id, user_id, status_message_id, list_of_message_ids, quality, original_thumbnail_id, user_settings))
     except Exception as e:
         logging.error(f"Download task {self.request.id} failed: {e}")
@@ -171,7 +170,8 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
 
         ffmpeg_command = [
             "ffmpeg", "-i", prep_data["input_path"],
-            "-c:v", "libx2ve", "-preset", ENCODE_PRESET, "-crf", ENCODE_CRF,
+            # --- FIX: Corrected the video codec from 'libx2ve' to 'libx265' ---
+            "-c:v", "libx265", "-preset", ENCODE_PRESET, "-crf", ENCODE_CRF,
             "-vf", f"scale=-2:{str(target_quality)}",
             "-c:a", "aac", "-b:a", AUDIO_BITRATE,
             "-metadata", f"encoder={brand_name}",
@@ -200,10 +200,12 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
                         await asyncio.sleep(e.value)
             await asyncio.sleep(0.1)
 
-        stderr_output = await process.stderr.read()
+        # --- IMPROVEMENT: Capture and log stderr for better debugging ---
+        stdout_output, stderr_output = await process.communicate()
         if process.returncode != 0: 
-            logging.error(f"FFmpeg failed! Stderr:\n{stderr_output.decode('utf-8')}")
-            raise RuntimeError("FFmpeg error during encoding.")
+            error_message = stderr_output.decode('utf-8').strip()
+            logging.error(f"FFmpeg failed for task {task_id}! Stderr:\n{error_message}")
+            raise RuntimeError(f"FFmpeg error during encoding. Details: {error_message.splitlines()[-1]}")
 
         async def upload_progress(current, total):
             nonlocal last_update_time
