@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import glob
 from celery import Celery
+from celery.exceptions import Ignore
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 from dotenv import load_dotenv
@@ -28,7 +29,16 @@ if REDIS_URL.startswith("rediss://"):
     REDIS_URL = f"{REDIS_URL}?ssl_cert_reqs=CERT_NONE"
 celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
 
-# --- UPDATED: Task now accepts thumbnail_file_id ---
+async def send_status_update(user_chat_id: int, message_text: str):
+    """A small, isolated async function to send status updates."""
+    app = Client(f"status_updater_{user_chat_id}", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, in_memory=True)
+    async with app:
+        try:
+            # For simplicity, we send a new message for retries instead of editing.
+            await app.send_message(user_chat_id, message_text)
+        except Exception as e:
+            logging.error(f"Failed to send status update to {user_chat_id}: {e}")
+
 async def _run_async_task(user_chat_id: int, list_of_message_ids: list, quality: str, thumbnail_file_id: str = None):
     app = Client("worker_session", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, in_memory=True)
     
@@ -70,13 +80,13 @@ async def _run_async_task(user_chat_id: int, list_of_message_ids: list, quality:
 
             await status_message.edit_text("🔬 File ready! Analyzing...")
             
-            # --- NEW: Download thumbnail if it exists ---
             if thumbnail_file_id:
                 logging.info(f"Downloading thumbnail: {thumbnail_file_id}")
                 thumb_path = await app.download_media(thumbnail_file_id, file_name=os.path.join(temp_dir, "thumb.jpg"))
 
             video_info = get_video_info(input_path)
             if not video_info:
+                # This is a non-retryable error. The file is bad.
                 raise ValueError("Could not get video information from the file. It might be corrupt.")
 
             original_height = int(video_info.get("height", 0))
@@ -99,27 +109,47 @@ async def _run_async_task(user_chat_id: int, list_of_message_ids: list, quality:
             if process.returncode != 0:
                 error_log = process.stderr
                 logging.error(f"FFmpeg failed! Stderr:\n{error_log}")
-                raise RuntimeError("FFmpeg encountered an error during encoding. Check logs.")
+                # FFmpeg errors are generally not retryable.
+                raise RuntimeError("FFmpeg encountered an error during encoding. Check logs for details.")
 
             await status_message.edit_text(f"Uploading `{output_filename}`...")
             
-            # --- UPDATED: Add the 'thumb' parameter to the upload call ---
             await app.send_document(
                 user_chat_id,
                 output_path,
                 caption=f"✅ Encode Complete!\n\n`{output_filename}`",
-                thumb=thumb_path # This will be None if no thumb was found
+                thumb=thumb_path
             )
             await status_message.edit_text("🚀 Upload complete! Job finished.")
 
-    except Exception as e:
-        logging.error(f"A critical error occurred in task: {e}")
-        error_message = f"💥 An error occurred with your file `{original_filename}`:\n\n`{str(e)}`"
-        await status_message.edit_text(error_message)
+    except (ValueError, RuntimeError) as e:
+        # These are specific errors we've decided are not worth retrying.
+        logging.error(f"Non-retryable error occurred: {e}")
+        await app.send_message(user_chat_id, f"💥 A critical error occurred that cannot be retried:\n\n`{str(e)}`")
+        raise Ignore() # Tells Celery to stop and not retry this task.
     finally:
         await app.stop()
 
-# --- UPDATED: Celery task definition to pass the new argument ---
-@celery_app.task(name="worker.tasks.encode_video_task")
-def encode_video_task(user_chat_id: int, list_of_message_ids: list, quality: str, thumbnail_file_id: str = None):
-    asyncio.run(_run_async_task(user_chat_id, list_of_message_ids, quality, thumbnail_file_id))
+# --- UPDATED: Celery task with retry logic ---
+@celery_app.task(
+    name="worker.tasks.encode_video_task",
+    bind=True,  # Makes 'self' available to the task
+    max_retries=3,
+    default_retry_delay=60  # Retry after 60 seconds
+)
+def encode_video_task(self, user_chat_id: int, list_of_message_ids: list, quality: str, thumbnail_file_id: str = None):
+    try:
+        asyncio.run(_run_async_task(user_chat_id, list_of_message_ids, quality, thumbnail_file_id))
+    except Exception as e:
+        logging.warning(f"Task failed. Attempt {self.request.retries + 1} of {self.max_retries}. Retrying in {self.default_retry_delay}s. Error: {e}")
+        
+        # Notify the user that a retry is happening
+        retry_message = (
+            f"⚠️ A temporary error occurred with your job. "
+            f"Retrying in {self.default_retry_delay} seconds... "
+            f"(Attempt {self.request.retries + 1} of {self.max_retries})"
+        )
+        asyncio.run(send_status_update(user_chat_id, retry_message))
+        
+        # This tells Celery to retry the task. It will re-raise the exception.
+        raise self.retry(exc=e)
