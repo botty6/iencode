@@ -3,6 +3,7 @@ import logging
 import asyncio
 import subprocess
 import tempfile
+import glob
 from celery import Celery
 from pyrogram import Client
 from pyrogram.errors import FloodWait
@@ -19,44 +20,58 @@ API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 BRANDING_TEXT = os.getenv("BRANDING_TEXT", "MyEnc")
 
-# --- NEW: Configurable Encoding Settings ---
-# These can be changed via environment variables without touching the code.
-ENCODE_PRESET = os.getenv("ENCODE_PRESET", "slow")  # e.g., ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
-ENCODE_CRF = os.getenv("ENCODE_CRF", "24")          # Constant Rate Factor (CRF). Lower is better quality, higher is smaller file. 18-28 is a good range.
-AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")  # e.g., 96k, 128k, 192k, 256k
+ENCODE_PRESET = os.getenv("ENCODE_PRESET", "slow")
+ENCODE_CRF = os.getenv("ENCODE_CRF", "24")
+AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 
 if REDIS_URL.startswith("rediss://"):
     REDIS_URL = f"{REDIS_URL}?ssl_cert_reqs=CERT_NONE"
 celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
 
-async def _run_async_task(user_chat_id: int, message_id: int, quality: str):
+async def _run_async_task(user_chat_id: int, list_of_message_ids: list, quality: str):
     app = Client("worker_session", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, in_memory=True)
     
     await app.start()
     
-    status_message = await app.send_message(user_chat_id, "⚙️ Job started. Preparing to download...")
-    original_filename = "unknown_file.tmp" # Default filename in case of error
+    status_message = await app.send_message(user_chat_id, "⚙️ Job started. Preparing to download files...")
+    original_filename = "unknown_file.tmp"
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            input_path = os.path.join(temp_dir, "input.tmp")
-            
-            message = await app.get_messages(user_chat_id, message_id)
-            
-            file_meta = message.video or message.document
+            # --- NEW: Download and Merge Logic ---
+            first_message = await app.get_messages(user_chat_id, list_of_message_ids[0])
+            file_meta = first_message.video or first_message.document
             original_filename = getattr(file_meta, "file_name", "unknown_file.tmp")
-
-            async def download_progress(current, total):
-                percent = round(current * 100 / total)
-                if percent % 10 == 0:
-                    try:
-                        await status_message.edit_text(f"Downloading `{original_filename}`... {percent}%")
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value)
-
-            await app.download_media(message, file_name=input_path, progress=download_progress)
             
-            await status_message.edit_text("🔬 Download complete! Analyzing video file...")
+            # This will be the final, merged input file for ffmpeg
+            merged_input_path = os.path.join(temp_dir, "merged_input.tmp")
+            
+            if len(list_of_message_ids) > 1:
+                parts_dir = os.path.join(temp_dir, "parts")
+                os.makedirs(parts_dir)
+                
+                for i, msg_id in enumerate(list_of_message_ids):
+                    await status_message.edit_text(f"Downloading part {i+1}/{len(list_of_message_ids)}...")
+                    part_path = os.path.join(parts_dir, f"part_{i:03d}")
+                    await app.download_media(message=msg_id, file_name=part_path)
+                
+                await status_message.edit_text("✅ All parts downloaded! Merging files...")
+                
+                # Use 'cat' command to merge binary files. Simple and effective.
+                # We sort the downloaded parts to ensure they are in the correct order.
+                part_files = sorted(glob.glob(os.path.join(parts_dir, "part_*")))
+                with open(merged_input_path, "wb") as merged_file:
+                    for part in part_files:
+                        with open(part, "rb") as f_part:
+                            merged_file.write(f_part.read())
+                
+                input_path = merged_input_path
+            else:
+                # Single file, download directly
+                await app.download_media(message=first_message, file_name=merged_input_path)
+                input_path = merged_input_path
+
+            await status_message.edit_text("🔬 File ready! Analyzing...")
             
             video_info = get_video_info(input_path)
             if not video_info:
@@ -66,7 +81,6 @@ async def _run_async_task(user_chat_id: int, message_id: int, quality: str):
             target_quality = int(quality)
 
             if original_height > 0 and target_quality > original_height:
-                logging.warning(f"User requested {target_quality}p, but original is {original_height}p. Capping quality to avoid upscaling.")
                 target_quality = original_height
             
             final_quality_str = str(target_quality)
@@ -76,7 +90,6 @@ async def _run_async_task(user_chat_id: int, message_id: int, quality: str):
 
             await status_message.edit_text(f"✅ Analysis complete! Starting encode for `{output_filename}`...")
             
-            # --- UPDATED: FFmpeg command now uses configurable settings ---
             ffmpeg_command = [
                 "ffmpeg", "-i", input_path,
                 "-c:v", "libx265",
@@ -96,29 +109,22 @@ async def _run_async_task(user_chat_id: int, message_id: int, quality: str):
                 logging.error(f"FFmpeg failed! Stderr:\n{error_log}")
                 raise RuntimeError("FFmpeg encountered an error during encoding. Check logs.")
 
-            async def upload_progress(current, total):
-                percent = round(current * 100 / total)
-                if percent % 10 == 0:
-                    try:
-                        await status_message.edit_text(f"Uploading `{output_filename}`... {percent}%")
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value)
+            await status_message.edit_text(f"Uploading `{output_filename}`...")
             
             await app.send_document(
                 user_chat_id,
                 output_path,
-                caption=f"✅ Encode Complete!\n\n`{output_filename}`",
-                progress=upload_progress
+                caption=f"✅ Encode Complete!\n\n`{output_filename}`"
             )
             await status_message.edit_text("🚀 Upload complete! Job finished.")
 
     except Exception as e:
-        logging.error(f"A critical error occurred in task for message {message_id}: {e}")
+        logging.error(f"A critical error occurred in task: {e}")
         error_message = f"💥 An error occurred with your file `{original_filename}`:\n\n`{str(e)}`"
         await status_message.edit_text(error_message)
     finally:
         await app.stop()
 
 @celery_app.task(name="worker.tasks.encode_video_task")
-def encode_video_task(user_chat_id: int, message_id: int, quality: str):
-    asyncio.run(_run_async_task(user_chat_id, message_id, quality))
+def encode_video_task(user_chat_id: int, list_of_message_ids: list, quality: str):
+    asyncio.run(_run_async_task(user_chat_id, list_of_message_ids, quality))
