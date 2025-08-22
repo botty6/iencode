@@ -70,18 +70,36 @@ async def queue_command(client, message):
         
     keyboard = []
     queue_text = "📂 **Your Active Queue:**\n\n"
+    active_job_messages = []
+
     for i, job in enumerate(jobs):
-        job_text = f"{i+1}️⃣ `{job['filename']}` → **{job['status']}**"
+        queue_text += f"{i+1}️⃣ `{job['filename']}` → **{job['status']}**\n"
         buttons = []
         if "Pending in default" in job.get('status', ''):
             buttons.append(InlineKeyboardButton(f"⚡️ Accelerate", callback_data=f"accelerate|{job['task_id']}"))
         
         buttons.append(InlineKeyboardButton(f"❌ Cancel", callback_data=f"cancel|{job['task_id']}"))
-        
-        queue_text += job_text + "\n"
         keyboard.append(buttons)
-    
+        
+        # --- NEW: Collect the message ID of the live status update ---
+        if "Pending" not in job.get('status', ''): # Don't forward for jobs that haven't started
+            active_job_messages.append(job['status_message_id'])
+
     await message.reply_text(queue_text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+    
+    # --- NEW: Forward the live progress messages to the user ---
+    if active_job_messages:
+        await message.reply_text("👇 **Live Progress for Active Jobs:**")
+        for msg_id in active_job_messages:
+            try:
+                await client.forward_messages(
+                    chat_id=user_id,
+                    from_chat_id=user_id,
+                    message_ids=msg_id
+                )
+            except Exception as e:
+                logger.warning(f"Could not forward status message {msg_id}. It might have been deleted. Error: {e}")
+
 
 @app.on_message(filters.command("settings") & filters.private)
 async def settings_command(client, message):
@@ -110,7 +128,8 @@ async def cancel_command(client, message):
         del user_states[user_id]
         await message.reply_text("Action canceled.")
 
-# --- Main File Handler ---
+# --- Main File Handler & Callback Handlers ---
+# (The rest of the file is identical to the previous complete version)
 @app.on_message((filters.video | filters.document | filters.photo) & filters.private)
 async def main_file_handler(client, message: Message):
     user_id = message.from_user.id
@@ -143,7 +162,6 @@ async def handle_video(client, message: Message):
         await message.reply_text(f"🎬 Received: `{file_name}`\nPlease choose quality:", reply_markup=create_new_job_keyboard(message.id))
 
 
-# --- Callback Handlers ---
 @app.on_callback_query(filters.regex(r"^encode"))
 async def button_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
@@ -205,8 +223,7 @@ async def accelerate_callback(client, callback_query: CallbackQuery):
         queue='high_priority'
     )
     
-    update_job_status(task_id_to_accelerate, "⚡️ Accelerated & Re-queued")
-    # We keep the old job record but update its status, the worker will handle the rest
+    update_job_status(task_id_to_accelerate, "⚡️ Accelerated")
     await callback_query.message.edit_text(f"🚀 Job for `{job_to_accelerate['filename']}` is now accelerated!")
 
 
