@@ -6,7 +6,7 @@ import tempfile
 import glob
 import time
 import shutil
-from celery import Celery
+from celery import Celery, chain
 from celery.exceptions import Ignore
 from kombu import Queue
 from pyrogram import Client
@@ -36,37 +36,38 @@ AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 if REDIS_URL.startswith("rediss://"):
     REDIS_URL = f"{REDIS_URL}?ssl_cert_reqs=CERT_NONE"
 
-# --- Celery App with Priority Queues ---
+# --- Celery App with HYBRID Queues ---
 celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
 
 celery_app.conf.task_queues = (
-    Queue('high_priority', routing_key='high_priority'),
+    Queue('io_queue', routing_key='io_queue'),
     Queue('default', routing_key='default'),
+    Queue('high_priority', routing_key='high_priority'),
 )
-celery_app.conf.task_default_queue = 'default'
-celery_app.conf.task_default_routing_key = 'default'
 
-async def send_status_update(user_chat_id: int, message_text: str):
-    app = Client(f"status_updater_{user_chat_id}", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, in_memory=True)
-    async with app:
-        try:
-            await app.send_message(user_chat_id, message_text)
-        except Exception as e:
-            logging.error(f"Failed to send status update to {user_chat_id}: {e}")
+# --- TASK 1: I/O-Bound Download Task (runs on Gevent worker) ---
+@celery_app.task(name="worker.tasks.download_task", bind=True)
+def download_task(self, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict):
+    """Synchronous wrapper for the async download and prep logic."""
+    try:
+        return asyncio.run(_run_download_and_prep(self.request.id, user_id, status_message_id, list_of_message_ids, quality, original_thumbnail_id, user_settings))
+    except Exception as e:
+        logging.error(f"Download task {self.request.id} failed: {e}")
+        # In a real scenario, you might want to update the status in the DB here
+        raise
 
-async def _run_async_task(task_id: str, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict, original_task_id: str = None):
-    app = Client("worker_session", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp", workers=WORKERS)
+async def _run_download_and_prep(task_id: str, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict):
+    app = Client(f"dl_{task_id}", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp", workers=WORKERS, in_memory=True)
     await app.start()
     
     status_message = await app.get_messages(user_id, status_message_id)
     last_update_time = 0
-
-    cache_key = original_task_id or task_id
-    job_cache_dir = os.path.join(DOWNLOAD_CACHE_DIR, cache_key)
-    merged_input_path = os.path.join(job_cache_dir, "merged_input.mkv")
     
+    job_cache_dir = os.path.join(DOWNLOAD_CACHE_DIR, task_id)
+    os.makedirs(job_cache_dir, exist_ok=True)
+    merged_input_path = os.path.join(job_cache_dir, "merged_input.mkv")
+
     try:
-        # --- CRITICAL FIX: Re-fetch messages inside the worker to get fresh file references ---
         messages = await app.get_messages(user_id, list_of_message_ids)
         if not isinstance(messages, list): messages = [messages]
 
@@ -74,75 +75,102 @@ async def _run_async_task(task_id: str, user_id: int, status_message_id: int, li
         file_meta = first_message.video or first_message.document
         original_filename = getattr(file_meta, "file_name", "unknown_file.tmp")
         
-        # Get a fresh thumbnail_id from the re-fetched message
         fresh_thumbnail_id = None
         if first_message.video and first_message.video.thumb:
             fresh_thumbnail_id = first_message.video.thumb.file_id
 
         total_size = sum(getattr(m.video or m.document, "file_size", 0) for m in messages)
-        if total_size == 0:
-            raise ValueError("File size is 0 B. This may be a protected file.")
+        if total_size == 0: raise ValueError("File size is 0 B.")
 
-        if os.path.exists(merged_input_path):
-            await status_message.edit_text("✅ Found cached file. Skipping download.")
-        else:
-            os.makedirs(job_cache_dir, exist_ok=True)
-            start_time = time.time()
-            current_size = 0
-            with open(merged_input_path, "wb") as f:
-                for message in messages:
-                    async for chunk in app.stream_media(message):
-                        f.write(chunk)
-                        current_size += len(chunk)
-                        
-                        now = time.time()
-                        if now - last_update_time > 5:
-                            last_update_time = now
-                            elapsed_time = now - start_time
-                            speed = current_size / elapsed_time if elapsed_time > 0 else 0
-                            progress_bar = create_progress_bar(current_size, total_size)
-                            text = (f"📥 **Downloading:** `{original_filename}`\n"
-                                    f"{progress_bar}\n"
-                                    f"`{humanbytes(current_size)}` of `{humanbytes(total_size)}`\n"
-                                    f"**Speed:** `{humanbytes(speed, speed=True)}`")
-                            try:
-                                await status_message.edit_text(text)
-                            except FloodWait as e:
-                                await asyncio.sleep(e.value)
+        start_time = time.time()
+        current_size = 0
+        with open(merged_input_path, "wb") as f:
+            for message in messages:
+                async for chunk in app.stream_media(message):
+                    f.write(chunk)
+                    current_size += len(chunk)
+                    
+                    now = time.time()
+                    if now - last_update_time > 5:
+                        last_update_time = now
+                        elapsed = now - start_time
+                        speed = current_size / elapsed if elapsed > 0 else 0
+                        progress_bar = create_progress_bar(current_size, total_size)
+                        text = (f"📥 **Downloading:** `{original_filename}`\n"
+                                f"{progress_bar}\n"
+                                f"`{humanbytes(current_size)}` of `{humanbytes(total_size)}`\n"
+                                f"**Speed:** `{humanbytes(speed, speed=True)}`")
+                        try:
+                            await status_message.edit_text(text)
+                        except FloodWait as e:
+                            await asyncio.sleep(e.value)
+
+        await status_message.edit_text("🔬 Analyzing downloaded file...")
         
-        await status_message.edit_text("🔬 File ready! Analyzing...")
-        
-        brand_name = user_settings.get("brand_name", DEFAULT_BRAND)
-        website = user_settings.get("website", DEFAULT_WEBSITE)
         custom_thumbnail_id = user_settings.get("custom_thumbnail_id")
-
+        
         thumb_path = None
         final_thumbnail_id = custom_thumbnail_id or fresh_thumbnail_id
         if final_thumbnail_id:
             thumb_path = await app.download_media(final_thumbnail_id, file_name=os.path.join(job_cache_dir, "thumb.jpg"))
-
-        video_info = get_video_info(merged_input_path)
-        if not video_info:
-            raise ValueError("Could not get video info. File might be corrupt.")
         
-        total_duration_sec = float(video_info.get("duration", 0))
-        if total_duration_sec <= 0:
-            raise ValueError("Video duration is invalid. Cannot calculate encoding progress.")
+        video_info = get_video_info(merged_input_path)
+        if not video_info: raise ValueError("Could not get video info from the downloaded file.")
+        
+        # Prepare all necessary data for the next task in the chain
+        return {
+            "user_id": user_id, "status_message_id": status_message_id,
+            "input_path": merged_input_path, "job_cache_dir": job_cache_dir,
+            "original_filename": original_filename, "quality": quality,
+            "thumb_path": thumb_path, "video_info": video_info,
+            "user_settings": user_settings
+        }
+    except Exception as e:
+        await status_message.edit_text(f"💥 Download/Prep Error: {e}")
+        raise
+    finally:
+        await app.stop()
 
-        original_height = int(video_info.get("height", 0))
-        target_quality = int(quality)
+# --- TASK 2: CPU-Bound Encode Task (runs on Prefork worker) ---
+@celery_app.task(name="worker.tasks.encode_task", bind=True)
+def encode_task(self, prep_data: dict):
+    """Synchronous wrapper for the async encode and upload logic."""
+    try:
+        return asyncio.run(_run_encode_and_upload(self.request.id, prep_data))
+    except Exception as e:
+        logging.error(f"Encode task {self.request.id} failed: {e}")
+        raise
+
+async def _run_encode_and_upload(task_id: str, prep_data: dict):
+    user_id = prep_data["user_id"]
+    status_message_id = prep_data["status_message_id"]
+    
+    app = Client(f"ul_{task_id}", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp", workers=WORKERS, in_memory=True)
+    await app.start()
+
+    status_message = await app.get_messages(user_id, status_message_id)
+    last_update_time = 0
+    job_cache_dir = prep_data["job_cache_dir"]
+    
+    try:
+        brand_name = prep_data["user_settings"].get("brand_name", DEFAULT_BRAND)
+        website = prep_data["user_settings"].get("website", DEFAULT_WEBSITE)
+        
+        total_duration_sec = float(prep_data["video_info"].get("duration", 0))
+        if total_duration_sec <= 0: raise ValueError("Video duration is invalid.")
+
+        original_height = int(prep_data["video_info"].get("height", 0))
+        target_quality = int(prep_data["quality"])
         if original_height > 0 and target_quality > original_height:
             target_quality = original_height
         
-        final_quality_str = str(target_quality)
-        
-        output_filename = generate_standard_filename(original_filename, final_quality_str, brand_name)
+        output_filename = generate_standard_filename(prep_data["original_filename"], str(target_quality), brand_name)
         output_path = os.path.join(job_cache_dir, output_filename)
 
         ffmpeg_command = [
-            "ffmpeg", "-i", merged_input_path,
+            "ffmpeg", "-i", prep_data["input_path"],
             "-c:v", "libx265", "-preset", ENCODE_PRESET, "-crf", ENCODE_CRF,
-            "-vf", f"scale=-2:{final_quality_str}",
+            "-vf", f"scale=-2:{str(target_quality)}",
             "-c:a", "aac", "-b:a", AUDIO_BITRATE,
             "-metadata", f"encoder={brand_name}",
             "-metadata", f"comment=Encoded by {brand_name} | Join us: {website}",
@@ -171,9 +199,9 @@ async def _run_async_task(task_id: str, user_id: int, status_message_id: int, li
             await asyncio.sleep(0.1)
 
         stderr_output = await process.stderr.read()
-        if process.returncode != 0:
+        if process.returncode != 0: 
             logging.error(f"FFmpeg failed! Stderr:\n{stderr_output.decode('utf-8')}")
-            raise RuntimeError("FFmpeg encountered an error during encoding.")
+            raise RuntimeError("FFmpeg error during encoding.")
 
         async def upload_progress(current, total):
             nonlocal last_update_time
@@ -189,29 +217,13 @@ async def _run_async_task(task_id: str, user_id: int, status_message_id: int, li
                 except FloodWait as e:
                     await asyncio.sleep(e.value)
 
-        await app.send_document(user_id, output_path, caption=f"✅ Encode Complete!\n\n`{output_filename}`", thumb=thumb_path, progress=upload_progress)
+        await app.send_document(user_id, output_path, caption=f"✅ Encode Complete!\n\n`{output_filename}`", thumb=prep_data["thumb_path"], progress=upload_progress)
         await status_message.delete()
-
-    except (ValueError, RuntimeError) as e:
-        await status_message.edit_text(f"💥 A critical, non-retryable error occurred:\n\n`{str(e)}`")
-        raise Ignore()
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        raise self.retry(exc=e)
+        
+    except Exception as e:
+        await status_message.edit_text(f"💥 Encode/Upload Error: {e}")
+        raise
     finally:
         await app.stop()
         if os.path.exists(job_cache_dir):
             shutil.rmtree(job_cache_dir)
-
-@celery_app.task(name="worker.tasks.encode_video_task", bind=True, max_retries=3, default_retry_delay=60)
-def encode_video_task(self, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict, original_task_id: str = None):
-    try:
-        task_id = self.request.id
-        asyncio.run(_run_async_task(task_id, user_id, status_message_id, list_of_message_ids, quality, original_thumbnail_id, user_settings, original_task_id))
-    except Ignore:
-        pass # Task is non-retryable, do nothing.
-    except Exception as e:
-        logging.warning(f"Task {self.request.id} failed. Attempt {self.request.retries + 1}. Retrying... Error: {e}")
-        retry_message = (f"⚠️ A temporary error occurred. Retrying... (Attempt {self.request.retries + 1})")
-        asyncio.run(send_status_update(user_id, retry_message))
-        raise self.retry(exc=e)
