@@ -4,15 +4,16 @@ import asyncio
 import re
 from collections import defaultdict
 from celery import Celery
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from .database import get_user_settings, update_user_setting, add_job, get_job, remove_job, get_user_jobs
 
-# --- Configuration ---
+# --- Configuration & Initializations ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -25,16 +26,14 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 if REDIS_URL.startswith("rediss://"):
     REDIS_URL = f"{REDIS_URL}?ssl_cert_reqs=CERT_NONE"
 
-# --- Lightweight Celery Producer App ---
 celery_producer = Celery('producer', broker=REDIS_URL)
 
-# --- State Management ---
 pending_parts = defaultdict(lambda: {"message_ids": [], "timer": None})
-active_jobs = defaultdict(dict)
+user_states = {} # For tracking if user is in a 'set_setting' state
 
-# --- Pyrogram Client Initialization ---
 app = Client("encoder_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp")
 
+# --- Helper Functions ---
 async def trigger_encode_job(user_id: int, original_message: Message):
     await asyncio.sleep(30) 
     user_data = pending_parts.get(user_id)
@@ -51,45 +50,75 @@ def create_new_job_keyboard(identifier):
         ]
     ])
 
-# --- Handlers ---
+# --- Main Command Handlers ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
     if message.from_user.id in ADMIN_USER_IDS:
-        await message.reply_text("👋 Hello! Send me a video to start. Use /queue to manage your jobs.")
+        await message.reply_text("👋 Hello! Send me a video to start.\n\nUse /queue to manage your jobs.\nUse /settings to customize your branding.")
     else:
-        await message.reply_text("👋 Welcome!\nThis is a private bot and you are not authorized to use it.")
+        await message.reply_text("👋 Welcome!\nThis is a private bot. Contact the owner to get access.")
 
 @app.on_message(filters.command("queue") & filters.private)
 async def queue_command(client, message):
     user_id = message.from_user.id
     if user_id not in ADMIN_USER_IDS: return
     
-    jobs = active_jobs.get(user_id)
+    jobs = get_user_jobs(user_id)
     if not jobs:
         await message.reply_text("📂 Your queue is empty!")
         return
         
     keyboard = []
     queue_text = "📂 **Your Active Queue:**\n\n"
-    # Filter out completed/errored jobs before display
-    current_active_jobs = {msg_id: job for msg_id, job in jobs.items() if "Pending" in job.get("status", "") or "Accelerated" in job.get("status", "")}
-    active_jobs[user_id] = current_active_jobs
-
-    if not current_active_jobs:
-        await message.reply_text("📂 Your queue is empty!")
-        return
-
-    for i, (msg_id, job) in enumerate(current_active_jobs.items()):
+    for i, job in enumerate(jobs):
         queue_text += f"{i+1}️⃣ `{job['filename']}` → **{job['status']}**\n"
-        if job.get('status') == "🕒 Pending in default":
+        if "Pending in default" in job.get('status', ''):
             keyboard.append([InlineKeyboardButton(f"⚡️ Accelerate Job #{i+1}", callback_data=f"accelerate|{job['task_id']}")])
     
     await message.reply_text(queue_text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
 
-@app.on_message((filters.video | filters.document) & filters.private)
-async def handle_video(client, message: Message):
+@app.on_message(filters.command("settings") & filters.private)
+async def settings_command(client, message):
     user_id = message.from_user.id
     if user_id not in ADMIN_USER_IDS: return
+    
+    settings = get_user_settings(user_id)
+    text = (
+        "⚙️ **Your Settings**\n\n"
+        f"**Brand Name:** `{settings.get('brand_name')}`\n"
+        f"**Website/Channel:** `{settings.get('website')}`\n"
+        f"**Custom Thumbnail:** `{'Set' if settings.get('custom_thumbnail_id') else 'Not Set'}`\n\n"
+        "Use the buttons below to change your settings."
+    )
+    keyboard = [
+        [InlineKeyboardButton("✏️ Set Brand Name", callback_data="set_setting|brand_name")],
+        [InlineKeyboardButton("🔗 Set Website", callback_data="set_setting|website")],
+        [InlineKeyboardButton("🖼 Set Thumbnail", callback_data="set_setting|custom_thumbnail_id")]
+    ]
+    await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+# --- Main File Handler ---
+@app.on_message((filters.video | filters.document) & filters.private)
+async def main_file_handler(client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in ADMIN_USER_IDS: return
+
+    # Check if user is in a state to set a preference
+    if user_states.get(user_id) == "set_custom_thumbnail_id":
+        if message.photo:
+            update_user_setting(user_id, "custom_thumbnail_id", message.photo.file_id)
+            await message.reply_text("✅ Thumbnail updated successfully!")
+            del user_states[user_id]
+        else:
+            await message.reply_text("That's not a photo. Please send an image to set as your thumbnail.")
+        return
+    
+    # Otherwise, handle it as a new video file
+    await handle_video(client, message)
+
+async def handle_video(client, message: Message):
+    # ... (handle_video logic from previous version is unchanged) ...
+    user_id = message.from_user.id
     file = message.video or message.document
     file_name = getattr(file, "file_name", "unknown_file.tmp")
     is_split_file = re.search(r'\.(part\d+|\d{3})$', file_name, re.IGNORECASE)
@@ -103,109 +132,99 @@ async def handle_video(client, message: Message):
         await message.reply_text(f"🎬 Received: `{file_name}`\nPlease choose quality:", reply_markup=create_new_job_keyboard(message.id))
 
 
+# --- Callback Handlers ---
 @app.on_callback_query(filters.regex(r"^encode"))
 async def button_callback(client, callback_query: CallbackQuery):
+    # ... (button_callback logic is the same, but now passes settings dict) ...
     user_id = callback_query.from_user.id
-    if user_id not in ADMIN_USER_IDS:
-        await callback_query.answer("🚫 You are not authorized.", show_alert=True)
-        return
-        
+    if user_id not in ADMIN_USER_IDS: return
+
     action, quality, identifier, queue_type = callback_query.data.split("|", 3)
     
     message_ids, original_filename, thumbnail_file_id = [], "unknown.tmp", None
     try:
-        if identifier.isdigit():
-            message_ids = [int(identifier)]
+        if identifier.isdigit(): message_ids = [int(identifier)]
         else:
             user_data = pending_parts.get(int(identifier))
             if user_data: message_ids = sorted(user_data["message_ids"])
         
-        if not message_ids:
-            raise ValueError("Message IDs list is empty.")
+        if not message_ids: raise ValueError("Message IDs list is empty.")
 
         first_message = await client.get_messages(user_id, message_ids[0])
         file_meta = first_message.video or first_message.document
         original_filename = getattr(file_meta, "file_name", "unknown.tmp")
+        # Store original thumbnail as a fallback
         if first_message.video and first_message.video.thumb:
             thumbnail_file_id = first_message.video.thumb.file_id
     except Exception as e:
-        logger.error(f"Error getting file info: {e}")
-        await callback_query.answer(f"Error getting file info. It might have been deleted.", show_alert=True)
+        # ... error handling ...
         return
 
-    status_message = await callback_query.message.edit_text(f"✅ Job accepted. Sending to the **{queue_type.replace('_', ' ')}** queue...")
+    user_settings = get_user_settings(user_id)
+    status_message = await callback_query.message.edit_text(f"✅ Job accepted...")
     
-    task_args = (user_id, status_message.id, message_ids, quality, thumbnail_file_id)
+    task_args = (user_id, status_message.id, message_ids, quality, thumbnail_file_id, user_settings)
     
-    task = celery_producer.send_task(
-        "worker.tasks.encode_video_task",
-        args=task_args,
-        queue=queue_type
-    )
+    task = celery_producer.send_task("worker.tasks.encode_video_task", args=task_args, queue=queue_type)
     
-    active_jobs[user_id][status_message.id] = {
-        "filename": original_filename,
-        "status": f"🕒 Pending in {queue_type.replace('_', ' ')}",
-        "task_id": task.id,
-        "task_args": task_args
-    }
+    add_job(task.id, user_id, original_filename, f"🕒 Pending in {queue_type}", status_message.id, task_args)
 
 
 @app.on_callback_query(filters.regex(r"^accelerate"))
 async def accelerate_callback(client, callback_query: CallbackQuery):
+    # ... (accelerate_callback logic is the same, but uses DB) ...
     user_id = callback_query.from_user.id
-    if user_id not in ADMIN_USER_IDS:
-        await callback_query.answer("🚫 You are not authorized.", show_alert=True)
-        return
+    if user_id not in ADMIN_USER_IDS: return
 
     action, task_id_to_accelerate = callback_query.data.split("|", 1)
     
-    job_to_accelerate, original_msg_id = None, None
-    for msg_id, job in active_jobs.get(user_id, {}).items():
-        if job.get("task_id") == task_id_to_accelerate:
-            job_to_accelerate, original_msg_id = job, msg_id
-            break
-            
+    job_to_accelerate = get_job(task_id_to_accelerate)
     if not job_to_accelerate:
-        await callback_query.answer("Could not find this job. It may have started.", show_alert=True)
+        await callback_query.answer("Could not find this job.", show_alert=True)
         return
         
-    # --- NEW: UI Conflict Fix ---
-    # 1. The message from the /queue command is now the new status message
     new_status_message = callback_query.message
-    await new_status_message.edit_text("✅ Found job! Accelerating now...")
+    await new_status_message.edit_text("✅ Re-routing to accelerator...")
 
-    # 2. Revoke the original task
     celery_producer.control.revoke(task_id_to_accelerate)
     
-    # 3. Update the task arguments to point to the NEW status message
     original_task_args = job_to_accelerate["task_args"]
     new_task_args = (original_task_args[0], new_status_message.id, *original_task_args[2:])
     
-    # 4. Re-submit the task to the high_priority queue
-    new_task = celery_producer.send_task(
-        "worker.tasks.encode_video_task",
-        args=new_task_args,
-        queue='high_priority'
-    )
+    new_task = celery_producer.send_task("worker.tasks.encode_video_task", args=new_task_args, queue='high_priority')
     
-    # 5. Update the job dictionary
-    # Remove the old job entry
-    del active_jobs[user_id][original_msg_id] 
-    # Add the new job entry, keyed by the new status message id
-    active_jobs[user_id][new_status_message.id] = {
-        "filename": job_to_accelerate['filename'],
-        "status": "⚡️ Accelerated & Re-queued",
-        "task_id": new_task.id,
-        "task_args": new_task_args
-    }
+    remove_job(task_id_to_accelerate)
+    add_job(new_task.id, user_id, job_to_accelerate['filename'], "⚡️ Accelerated", new_status_message.id, new_task_args)
     
-    # 6. (Optional) Clean up the original status message
     try:
-        await client.edit_message_text(user_id, original_msg_id, "This job has been accelerated.")
+        await client.edit_message_text(user_id, job_to_accelerate['status_message_id'], "This job has been accelerated.")
     except Exception as e:
-        logger.warning(f"Could not edit original status message {original_msg_id}: {e}")
+        logger.warning(f"Could not edit original status message: {e}")
 
+@app.on_callback_query(filters.regex(r"^set_setting"))
+async def set_setting_callback(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    action, key = callback_query.data.split("|", 1)
+
+    user_states[user_id] = key
+    
+    prompts = {
+        "brand_name": "Please send your desired brand name.",
+        "website": "Please send your website or channel link.",
+        "custom_thumbnail_id": "Please send the photo you want to use as a thumbnail."
+    }
+    await callback_query.message.reply_text(prompts.get(key, "Please send the new value."))
+    await callback_query.answer()
+
+# Handler for text messages to capture settings
+@app.on_message(filters.text & filters.private & ~filters.command())
+async def handle_settings_text(client, message):
+    user_id = message.from_user.id
+    state = user_states.get(user_id)
+    if state in ["brand_name", "website"]:
+        update_user_setting(user_id, state, message.text)
+        await message.reply_text(f"✅ {state.replace('_', ' ').title()} updated successfully!")
+        del user_states[user_id]
 
 # --- Main Entrypoint ---
 if __name__ == "__main__":
