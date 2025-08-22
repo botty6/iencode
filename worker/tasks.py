@@ -185,14 +185,11 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
             if not line_bytes: break
             line = line_bytes.decode('utf-8').strip()
             if "out_time_ms" in line:
-                # --- START: ROBUST PROGRESS PARSING ---
                 try:
                     time_str = line.split("=")[1]
                     current_time_sec = int(time_str) / 1_000_000
                 except (ValueError, IndexError):
-                    # Gracefully skip malformed progress lines (e.g., out_time_ms=N/A)
                     continue
-                # --- END: ROBUST PROGRESS PARSING ---
                 
                 now = time.time()
                 if now - last_update_time > 5:
@@ -209,9 +206,14 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
         if process.returncode != 0: 
             error_message = stderr_output.decode('utf-8').strip()
             logging.error(f"FFmpeg failed for task {task_id}! Stderr:\n{error_message}")
-            # Raise a more informative error to the user
             last_line_of_error = error_message.splitlines()[-1] if error_message else "Unknown FFmpeg error"
             raise RuntimeError(f"FFmpeg error: {last_line_of_error}")
+
+        # --- START: NEW POST-ENCODE VALIDATION ---
+        # Check if the output file exists and is not empty.
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise RuntimeError("Encoding resulted in an empty file. The source video may be corrupt.")
+        # --- END: NEW POST-ENCODE VALIDATION ---
 
         async def upload_progress(current, total):
             nonlocal last_update_time
@@ -237,3 +239,4 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
         await app.stop()
         if os.path.exists(job_cache_dir):
             shutil.rmtree(job_cache_dir)
+            
