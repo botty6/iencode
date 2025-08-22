@@ -10,18 +10,23 @@ MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
     raise Exception("CRITICAL: MONGO_URI environment variable is not set!")
 
-# --- NEW: Allow custom database name from URI ---
-parsed_uri = urlparse(MONGO_URI)
-db_name = parsed_uri.path.lstrip('/') or "iencode_bot" # Default to 'iencode_bot' if no path is specified
-
+# --- NEW: Intelligently parse the database name from the URI ---
 try:
+    parsed_uri = urlparse(MONGO_URI)
+    # Get the path from the URI, remove the leading '/', and use it as the DB name.
+    # If no path is specified, default to 'iencode_bot'.
+    db_name = parsed_uri.path.lstrip('/') or "iencode_bot" 
+
     client = MongoClient(MONGO_URI)
-    db = client[db_name]
-    # The ismaster command is cheap and does not require auth.
+    db = client[db_name] # Use the dynamically parsed or default database name
+    
+    # Check the connection
     client.admin.command('ismaster')
-    print("✅ MongoDB connection successful.")
+    print(f"✅ MongoDB connection successful. Using database: '{db_name}'")
 except errors.ConnectionFailure as e:
     raise Exception(f"❌ Could not connect to MongoDB: {e}")
+except Exception as e:
+    raise Exception(f"❌ An error occurred during MongoDB setup: {e}")
 
 
 users_collection = db.users
@@ -30,7 +35,7 @@ jobs_collection = db.jobs
 def get_user_settings(user_id: int):
     """Fetches a user's settings, returning global defaults if none are found."""
     user_data = users_collection.find_one({"user_id": user_id})
-    # Fallback to environment variables for defaults
+    
     default_brand = os.getenv("BRANDING_TEXT", "MyEnc")
     default_website = os.getenv("BRANDING_WEBSITE", "t.me/YourChannel")
 
@@ -41,7 +46,6 @@ def get_user_settings(user_id: int):
             "custom_thumbnail_id": None
         }
     
-    # Ensure all keys are present, falling back to defaults
     settings = user_data.get("settings", {})
     settings.setdefault("brand_name", default_brand)
     settings.setdefault("website", default_website)
