@@ -24,8 +24,6 @@ ADMIN_USER_IDS = [int(uid.strip()) for uid in os.getenv("ADMIN_USER_IDS", "").sp
 PORT = int(os.getenv("PORT", "8080"))
 
 # --- State Management for Multi-part Uploads ---
-# This will store message IDs for users who are uploading split files.
-# Format: {user_id: {"message_ids": [id1, id2, ...], "timer": asyncio.Task}}
 pending_parts = defaultdict(lambda: {"message_ids": [], "timer": None})
 
 
@@ -40,15 +38,13 @@ async def trigger_encode_job(user_id: int, original_message: Message):
 
     user_data = pending_parts.get(user_id)
     if not user_data or not user_data["message_ids"]:
-        return # Should not happen, but a good safeguard
+        return
 
     file_count = len(user_data["message_ids"])
     await original_message.reply_text(
         f"✅ Received {file_count} parts. Please choose an output quality to merge and encode:",
         reply_markup=create_quality_keyboard(user_id)
     )
-    # The job is now ready, but we wait for the user to press a button.
-    # The timer's job is done.
     user_data["timer"] = None
 
 def create_quality_keyboard(identifier):
@@ -78,18 +74,14 @@ async def handle_video(client, message: Message):
     file = message.video or message.document
     file_name = getattr(file, "file_name", "unknown_file.tmp")
     
-    # --- NEW: Multi-part file detection logic ---
-    # Regex to detect common split file patterns (e.g., .001, .part1, .part01)
     is_split_file = re.search(r'\.(part\d+|\d{3})$', file_name, re.IGNORECASE)
 
     if is_split_file:
         user_data = pending_parts[user_id]
         
-        # Cancel any existing timer, as a new part has arrived
         if user_data["timer"]:
             user_data["timer"].cancel()
             
-        # Add the new message ID to the list
         user_data["message_ids"].append(message.id)
         
         await message.reply_text(
@@ -99,10 +91,8 @@ async def handle_video(client, message: Message):
             quote=True
         )
         
-        # Start a new timer
         user_data["timer"] = asyncio.create_task(trigger_encode_job(user_id, message))
     else:
-        # This is a single, non-split file
         keyboard = create_quality_keyboard(message.id)
         await message.reply_text(f"🎬 Received file: `{file_name}`\nPlease choose an output quality:", reply_markup=keyboard)
 
@@ -118,18 +108,14 @@ async def button_callback(client, callback_query: CallbackQuery):
     
     message_ids = []
     
-    # --- NEW: Differentiate between single file and multi-part jobs ---
     try:
-        # If identifier is a number, it's a single message ID
         message_ids = [int(identifier)]
         job_type = "Single file"
     except ValueError:
-        # If it's not a number, it must be the user_id for a multi-part job
         user_data = pending_parts.get(int(identifier))
         if user_data and user_data["message_ids"]:
-            message_ids = sorted(user_data["message_ids"]) # Sort to ensure correct order
+            message_ids = sorted(user_data["message_ids"])
             job_type = f"{len(message_ids)}-part job"
-            # Clear the pending parts for this user as the job is now being queued
             del pending_parts[int(identifier)]
         else:
             await callback_query.answer("Error: Could not find the file parts for this job.", show_alert=True)
@@ -139,13 +125,26 @@ async def button_callback(client, callback_query: CallbackQuery):
         await callback_query.answer("Error: No files found for this job.", show_alert=True)
         return
 
+    # --- NEW: Thumbnail Detection Logic ---
+    thumbnail_file_id = None
+    try:
+        # We check the first message in the list for a thumbnail
+        first_message = await client.get_messages(user_id, message_ids[0])
+        if first_message.video and first_message.video.thumb:
+            thumbnail_file_id = first_message.video.thumb.file_id
+            logger.info(f"Found thumbnail with file_id: {thumbnail_file_id} for job.")
+    except Exception as e:
+        logger.warning(f"Could not retrieve thumbnail for message {message_ids[0]}: {e}")
+
     await callback_query.answer("✅ Job sent to queue!")
     await callback_query.message.edit_text(f"⏳ Your {job_type} is now in the queue for a {quality}p encode...")
     
+    # --- UPDATED: Pass thumbnail_file_id to the worker task ---
     encode_video_task.delay(
         user_chat_id=callback_query.message.chat.id,
         list_of_message_ids=message_ids,
         quality=quality,
+        thumbnail_file_id=thumbnail_file_id # Can be None
     )
 
 # --- Main Entrypoint ---
