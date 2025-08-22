@@ -37,7 +37,7 @@ def get_video_info(input_path: str):
             logging.warning(f"No video stream found in {input_path}")
             return None
 
-        # --- START: NEW VALIDATION BLOCK ---
+        # --- START: VALIDATION BLOCK ---
         duration_str = video_stream.get("duration")
         if not duration_str:
             duration_str = info.get("format", {}).get("duration")
@@ -52,7 +52,7 @@ def get_video_info(input_path: str):
             video_stream['height'] = int(video_stream.get("height"))
         except (ValueError, TypeError):
             video_stream['height'] = 0
-        # --- END: NEW VALIDATION BLOCK ---
+        # --- END: VALIDATION BLOCK ---
         
         return video_stream
         
@@ -101,7 +101,6 @@ def create_progress_bar(current, total, bar_length=20):
     spaces = '░' * (bar_length - len(arrow))
     return f"[{arrow}{spaces}] {percent:.2f}%"
 
-# --- UPDATED: humanbytes can now format speed ---
 def humanbytes(size, speed=False):
     """Converts bytes to a human-readable format, optionally as a speed."""
     if not size:
