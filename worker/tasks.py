@@ -170,7 +170,6 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
 
         ffmpeg_command = [
             "ffmpeg", "-i", prep_data["input_path"],
-            # --- FIX: Corrected the video codec from 'libx2ve' to 'libx265' ---
             "-c:v", "libx265", "-preset", ENCODE_PRESET, "-crf", ENCODE_CRF,
             "-vf", f"scale=-2:{str(target_quality)}",
             "-c:a", "aac", "-b:a", AUDIO_BITRATE,
@@ -186,8 +185,14 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
             if not line_bytes: break
             line = line_bytes.decode('utf-8').strip()
             if "out_time_ms" in line:
-                time_str = line.split("=")[1]
-                current_time_sec = int(time_str) / 1_000_000
+                # --- START: ROBUST PROGRESS PARSING ---
+                try:
+                    time_str = line.split("=")[1]
+                    current_time_sec = int(time_str) / 1_000_000
+                except (ValueError, IndexError):
+                    # Gracefully skip malformed progress lines (e.g., out_time_ms=N/A)
+                    continue
+                # --- END: ROBUST PROGRESS PARSING ---
                 
                 now = time.time()
                 if now - last_update_time > 5:
@@ -200,12 +205,13 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
                         await asyncio.sleep(e.value)
             await asyncio.sleep(0.1)
 
-        # --- IMPROVEMENT: Capture and log stderr for better debugging ---
         stdout_output, stderr_output = await process.communicate()
         if process.returncode != 0: 
             error_message = stderr_output.decode('utf-8').strip()
             logging.error(f"FFmpeg failed for task {task_id}! Stderr:\n{error_message}")
-            raise RuntimeError(f"FFmpeg error during encoding. Details: {error_message.splitlines()[-1]}")
+            # Raise a more informative error to the user
+            last_line_of_error = error_message.splitlines()[-1] if error_message else "Unknown FFmpeg error"
+            raise RuntimeError(f"FFmpeg error: {last_line_of_error}")
 
         async def upload_progress(current, total):
             nonlocal last_update_time
