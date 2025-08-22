@@ -11,7 +11,7 @@ from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from database import get_user_settings, update_user_setting, add_job, get_job, remove_job, get_user_jobs
+from database import get_user_settings, update_user_setting, add_job, get_job, remove_job, get_user_jobs, update_job_status
 
 # --- Configuration & Initializations ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -71,9 +71,15 @@ async def queue_command(client, message):
     keyboard = []
     queue_text = "📂 **Your Active Queue:**\n\n"
     for i, job in enumerate(jobs):
-        queue_text += f"{i+1}️⃣ `{job['filename']}` → **{job['status']}**\n"
+        job_text = f"{i+1}️⃣ `{job['filename']}` → **{job['status']}**"
+        buttons = []
         if "Pending in default" in job.get('status', ''):
-            keyboard.append([InlineKeyboardButton(f"⚡️ Accelerate Job #{i+1}", callback_data=f"accelerate|{job['task_id']}")])
+            buttons.append(InlineKeyboardButton(f"⚡️ Accelerate", callback_data=f"accelerate|{job['task_id']}"))
+        
+        buttons.append(InlineKeyboardButton(f"❌ Cancel", callback_data=f"cancel|{job['task_id']}"))
+        
+        queue_text += job_text + "\n"
+        keyboard.append(buttons)
     
     await message.reply_text(queue_text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
 
@@ -110,17 +116,15 @@ async def main_file_handler(client, message: Message):
     user_id = message.from_user.id
     if user_id not in ADMIN_USER_IDS: return
 
-    # Check if user is in a state to set a preference
     if user_states.get(user_id) == "set_custom_thumbnail_id":
         if message.photo:
             update_user_setting(user_id, "custom_thumbnail_id", message.photo.file_id)
             await message.reply_text("✅ Thumbnail updated successfully!")
             del user_states[user_id]
         else:
-            await message.reply_text("That's not a photo. Please send an image to set as your thumbnail, or /cancel.")
+            await message.reply_text("That's not a photo. Please send an image or /cancel.")
         return
     
-    # Otherwise, handle it as a new video file
     if message.video or message.document:
         await handle_video(client, message)
 
@@ -188,29 +192,49 @@ async def accelerate_callback(client, callback_query: CallbackQuery):
         await callback_query.answer("Could not find this job.", show_alert=True)
         return
         
-    new_status_message = callback_query.message
-    await new_status_message.edit_text("✅ Re-routing to accelerator...")
+    await callback_query.message.edit_text("✅ Re-routing to the high-priority accelerator lane...")
 
-    celery_producer.control.revoke(task_id_to_accelerate)
+    celery_producer.control.revoke(task_id_to_accelerate, terminate=True)
     
     original_task_args = job_to_accelerate["task_args"]
-    new_task_args = (original_task_args[0], new_status_message.id, *original_task_args[2:])
     
-    new_task = celery_producer.send_task("worker.tasks.encode_video_task", args=new_task_args, queue='high_priority')
+    new_task = celery_producer.send_task(
+        "worker.tasks.encode_video_task",
+        args=original_task_args,
+        kwargs={"original_task_id": task_id_to_accelerate},
+        queue='high_priority'
+    )
     
-    remove_job(task_id_to_accelerate)
-    add_job(new_task.id, user_id, job_to_accelerate['filename'], "⚡️ Accelerated", new_status_message.id, new_task_args)
+    update_job_status(task_id_to_accelerate, "⚡️ Accelerated & Re-queued")
+    # We keep the old job record but update its status, the worker will handle the rest
+    await callback_query.message.edit_text(f"🚀 Job for `{job_to_accelerate['filename']}` is now accelerated!")
+
+
+@app.on_callback_query(filters.regex(r"^cancel"))
+async def cancel_callback(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    if user_id not in ADMIN_USER_IDS: return
+
+    action, task_id_to_cancel = callback_query.data.split("|", 1)
     
+    job_to_cancel = get_job(task_id_to_cancel)
+    if not job_to_cancel:
+        await callback_query.answer("Could not find this job.", show_alert=True)
+        return
+    
+    celery_producer.control.revoke(task_id_to_cancel, terminate=True)
+    remove_job(task_id_to_cancel)
+    
+    await callback_query.message.edit_text(f"✅ Job for `{job_to_cancel['filename']}` has been cancelled.")
     try:
-        await client.edit_message_text(user_id, job_to_accelerate['status_message_id'], "This job has been accelerated and is now tracked in a new message.")
+        await client.edit_message_text(user_id, job_to_cancel['status_message_id'], "❌ Job Cancelled by User.")
     except Exception as e:
-        logger.warning(f"Could not edit original status message: {e}")
+        logger.warning(f"Could not edit original status message for cancelled job: {e}")
 
 @app.on_callback_query(filters.regex(r"^set_setting"))
 async def set_setting_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     action, key = callback_query.data.split("|", 1)
-
     user_states[user_id] = key
     
     prompts = {
@@ -221,12 +245,10 @@ async def set_setting_callback(client, callback_query: CallbackQuery):
     await callback_query.message.reply_text(f"▶️ {prompts.get(key, 'Please send the new value.')}\n\nOr send /cancel to abort.")
     await callback_query.answer()
 
-# --- CRITICAL FIX: Removed the broken ~filters.command() ---
 @app.on_message(filters.text & filters.private)
 async def handle_settings_text(client, message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
-    # This handler will not trigger for commands because the command handlers above have priority.
     if state in ["brand_name", "website"]:
         update_user_setting(user_id, state, message.text)
         await message.reply_text(f"✅ `{state.replace('_', ' ').title()}` has been updated to: `{message.text}`")
