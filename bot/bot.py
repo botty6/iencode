@@ -1,5 +1,3 @@
-# iencode-main/bot/bot.py
-
 import os
 import logging
 import asyncio
@@ -13,7 +11,6 @@ from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-# --- REFACTORED: Import from top-level database.py ---
 import database
 from worker.tasks import download_task, encode_task
 
@@ -68,19 +65,30 @@ async def queue_command(client, message):
         await message.reply_text("📂 Your queue is empty!")
         return
         
-    keyboard = []
+    # --- REFACTORED: Queue Display Logic ---
     queue_text = "📂 **Your Active Queue:**\n\n"
-    for i, job in enumerate(jobs):
-        job_text = f"{i+1}️⃣ `{job['filename']}` → **{job['status']}**"
-        buttons = []
-        if job.get('job_data', {}).get('cpu_queue') == 'default':
-            buttons.append(InlineKeyboardButton(f"⚡️ Accelerate", callback_data=f"accelerate|{job['task_id']}"))
-        
-        buttons.append(InlineKeyboardButton(f"❌ Cancel", callback_data=f"cancel|{job['task_id']}"))
-        queue_text += job_text + "\n"
-        keyboard.append(buttons)
+    keyboard = []
     
-    await message.reply_text(queue_text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+    for i, job in enumerate(jobs):
+        job_number = i + 1
+        queue_text += f"**{job_number}️⃣ `{job['filename']}`**\nStatus: `{job['status']}`\n"
+        
+        action_buttons = []
+        # Add Cancel button for this specific job
+        action_buttons.append(InlineKeyboardButton(f"❌ Cancel #{job_number}", callback_data=f"cancel|{job['task_id']}"))
+        
+        # Add Accelerate button if the job is in the default queue
+        if job.get('job_data', {}).get('cpu_queue') == 'default':
+            action_buttons.append(InlineKeyboardButton(f"⚡️ Accelerate #{job_number}", callback_data=f"accelerate|{job['task_id']}"))
+        
+        # Add the row of buttons for this job
+        keyboard.append(action_buttons)
+    
+    # Add a "Cancel All" button at the end
+    if jobs:
+        keyboard.append([InlineKeyboardButton("🗑️ Cancel All Jobs", callback_data="cancel_all|user")])
+    
+    await message.reply_text(queue_text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 @app.on_message(filters.command("settings") & filters.private)
 async def settings_command(client, message):
@@ -99,7 +107,7 @@ async def settings_command(client, message):
     await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 @app.on_message(filters.command("cancel") & filters.private)
-async def cancel_command(client, message):
+async def cancel_command_from_user(client, message):
     user_id = message.from_user.id
     if user_id in user_states:
         del user_states[user_id]
@@ -157,11 +165,11 @@ def start_encode_pipeline(job_data: dict):
     )
     return pipeline.apply_async()
 
-@app.on_callback_query(filters.regex(r"^(quality|encode|accelerate|cancel|set_setting)"))
+@app.on_callback_query(filters.regex(r"^(quality|encode|accelerate|cancel|cancel_all|set_setting)"))
 async def callback_router(client, callback_query: CallbackQuery):
     action = callback_query.data.split("|")[0]
     handlers = {"quality": quality_callback, "encode": encode_callback, "accelerate": accelerate_callback,
-                "cancel": cancel_callback, "set_setting": set_setting_callback}
+                "cancel": cancel_callback, "cancel_all": cancel_all_callback, "set_setting": set_setting_callback}
     handler = handlers.get(action)
     if handler: await handler(client, callback_query)
 
@@ -218,7 +226,7 @@ async def accelerate_callback(client, callback_query: CallbackQuery):
     new_result = start_encode_pipeline(job_data)
     database.remove_job(task_id)
     database.add_job(new_result.id, user_id, job['filename'], job['status_message_id'], job_data)
-    await callback_query.message.edit_text("✅ Job has been moved to the high-priority accelerator queue!")
+    await callback_query.message.edit_text("✅ Job has been moved to the high-priority accelerator queue! The queue will update shortly.")
 
 async def cancel_callback(client, callback_query: CallbackQuery):
     await callback_query.answer("❌ Cancelling job...", show_alert=False)
@@ -230,11 +238,31 @@ async def cancel_callback(client, callback_query: CallbackQuery):
         return
     celery_producer.control.revoke(task_id, terminate=True, signal='SIGKILL')
     database.update_job_status(task_id, "CANCELLED")
-    await callback_query.message.edit_text(f"✅ Job for `{job['filename']}` has been cancelled.")
+    await callback_query.message.edit_text(f"✅ Job for `{job['filename']}` has been cancelled. The queue will update shortly.")
     try:
         await client.edit_message_text(user_id, job['status_message_id'], "❌ Job Cancelled by User.")
     except Exception as e:
         logger.warning(f"Could not edit original status message: {e}")
+
+async def cancel_all_callback(client, callback_query: CallbackQuery):
+    """NEW: Cancels all active jobs for the user."""
+    user_id = callback_query.from_user.id
+    await callback_query.answer("🗑️ Cancelling all jobs...", show_alert=False)
+    
+    jobs_to_cancel = database.get_user_jobs(user_id)
+    if not jobs_to_cancel:
+        await callback_query.message.edit_text("There are no active jobs to cancel.")
+        return
+        
+    for job in jobs_to_cancel:
+        celery_producer.control.revoke(job['task_id'], terminate=True, signal='SIGKILL')
+        database.update_job_status(job['task_id'], "CANCELLED")
+        try:
+            await client.edit_message_text(user_id, job['status_message_id'], "❌ Job Cancelled by User.")
+        except Exception:
+            pass # Ignore if message is already gone
+            
+    await callback_query.message.edit_text("✅ All active jobs have been cancelled.")
 
 async def set_setting_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
