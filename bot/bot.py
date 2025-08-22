@@ -11,7 +11,6 @@ from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-# --- CRITICAL FIX: Changed from relative to absolute import ---
 from database import get_user_settings, update_user_setting, add_job, get_job, remove_job, get_user_jobs
 
 # --- Configuration & Initializations ---
@@ -98,6 +97,13 @@ async def settings_command(client, message):
     ]
     await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
+@app.on_message(filters.command("cancel") & filters.private)
+async def cancel_command(client, message):
+    user_id = message.from_user.id
+    if user_id in user_states:
+        del user_states[user_id]
+        await message.reply_text("Action canceled.")
+
 # --- Main File Handler ---
 @app.on_message((filters.video | filters.document | filters.photo) & filters.private)
 async def main_file_handler(client, message: Message):
@@ -153,7 +159,6 @@ async def button_callback(client, callback_query: CallbackQuery):
         first_message = await client.get_messages(user_id, message_ids[0])
         file_meta = first_message.video or first_message.document
         original_filename = getattr(file_meta, "file_name", "unknown.tmp")
-        # Store original thumbnail as a fallback
         if first_message.video and first_message.video.thumb:
             thumbnail_file_id = first_message.video.thumb.file_id
     except Exception as e:
@@ -216,24 +221,17 @@ async def set_setting_callback(client, callback_query: CallbackQuery):
     await callback_query.message.reply_text(f"▶️ {prompts.get(key, 'Please send the new value.')}\n\nOr send /cancel to abort.")
     await callback_query.answer()
 
-# Handler for text messages to capture settings
-@app.on_message(filters.text & filters.private & ~filters.command())
+# --- CRITICAL FIX: Removed the broken ~filters.command() ---
+@app.on_message(filters.text & filters.private)
 async def handle_settings_text(client, message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
+    # This handler will not trigger for commands because the command handlers above have priority.
     if state in ["brand_name", "website"]:
         update_user_setting(user_id, state, message.text)
         await message.reply_text(f"✅ `{state.replace('_', ' ').title()}` has been updated to: `{message.text}`")
         del user_states[user_id]
         
-@app.on_message(filters.command("cancel") & filters.private)
-async def cancel_command(client, message):
-    user_id = message.from_user.id
-    if user_id in user_states:
-        del user_states[user_id]
-        await message.reply_text("Action canceled.")
-
-
 # --- Main Entrypoint ---
 if __name__ == "__main__":
     if not all([BOT_TOKEN, API_ID, API_HASH, ADMIN_USER_IDS]):
