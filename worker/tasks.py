@@ -50,7 +50,7 @@ celery_app.conf.task_queues = (
 def download_task(self, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict):
     """Synchronous wrapper for the async download and prep logic."""
     try:
-        # --- THIS LINE IS NOW FIXED ---
+        # ❗❗❗ THIS IS THE LINE THAT WAS FIXED ❗❗❗
         return asyncio.run(_run_download_and_prep(self.request.id, user_id, status_message_id, list_of_message_ids, quality, original_thumbnail_id, user_settings))
     except Exception as e:
         logging.error(f"Download task {self.request.id} failed: {e}")
@@ -117,7 +117,6 @@ async def _run_download_and_prep(task_id: str, user_id: int, status_message_id: 
         video_info = get_video_info(merged_input_path)
         if not video_info: raise ValueError("Could not get video info from the downloaded file.")
         
-        # Prepare all necessary data for the next task in the chain
         return {
             "user_id": user_id, "status_message_id": status_message_id,
             "input_path": merged_input_path, "job_cache_dir": job_cache_dir,
@@ -131,7 +130,6 @@ async def _run_download_and_prep(task_id: str, user_id: int, status_message_id: 
     finally:
         await app.stop()
 
-# --- TASK 2: CPU-Bound Encode Task (runs on Prefork worker) ---
 @celery_app.task(name="worker.tasks.encode_task", bind=True)
 def encode_task(self, prep_data: dict):
     """Synchronous wrapper for the async encode and upload logic."""
@@ -156,7 +154,6 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
         brand_name = prep_data["user_settings"].get("brand_name", DEFAULT_BRAND)
         website = prep_data["user_settings"].get("website", DEFAULT_WEBSITE)
         
-        # --- START: GUARD CLAUSE ---
         total_duration_sec = float(prep_data["video_info"].get("duration", 0))
         original_height = int(prep_data["video_info"].get("height", 0))
 
@@ -164,7 +161,6 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
             raise ValueError("Video duration is invalid or zero. The file may be corrupt.")
         if original_height <= 0:
             raise ValueError("Could not determine video height. The file may be corrupt or not a video.")
-        # --- END: GUARD CLAUSE ---
 
         target_quality = int(prep_data["quality"])
         if original_height > 0 and target_quality > original_height:
@@ -175,7 +171,7 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
 
         ffmpeg_command = [
             "ffmpeg", "-i", prep_data["input_path"],
-            "-c:v", "libx265", "-preset", ENCODE_PRESET, "-crf", ENCODE_CRF,
+            "-c:v", "libx2ve", "-preset", ENCODE_PRESET, "-crf", ENCODE_CRF,
             "-vf", f"scale=-2:{str(target_quality)}",
             "-c:a", "aac", "-b:a", AUDIO_BITRATE,
             "-metadata", f"encoder={brand_name}",
