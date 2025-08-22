@@ -3,7 +3,7 @@ import logging
 import asyncio
 import re
 from collections import defaultdict
-from celery import Celery
+from celery import Celery, chain
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     Message,
@@ -12,6 +12,7 @@ from pyrogram.types import (
     InlineKeyboardMarkup,
 )
 from database import get_user_settings, update_user_setting, add_job, get_job, remove_job, get_user_jobs, update_job_status
+from worker.tasks import download_task, encode_task # Import the specific tasks
 
 # --- Configuration & Initializations ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -142,11 +143,20 @@ async def handle_video(client, message: Message):
         await message.reply_text(f"🎬 Received: `{file_name}`\nPlease choose quality:", reply_markup=create_new_job_keyboard(message.id))
 
 
-@app.on_callback_query(filters.regex(r"^encode"))
+@app.on_callback_query(filters.regex(r"^(encode|accelerate|cancel|set_setting)"))
+async def callback_router(client, callback_query: CallbackQuery):
+    action = callback_query.data.split("|")[0]
+    if action == "encode":
+        await button_callback(client, callback_query)
+    elif action == "accelerate":
+        await accelerate_callback(client, callback_query)
+    elif action == "cancel":
+        await cancel_callback(client, callback_query)
+    elif action == "set_setting":
+        await set_setting_callback(client, callback_query)
+
 async def button_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
-    if user_id not in ADMIN_USER_IDS: return
-
     action, quality, identifier, queue_type = callback_query.data.split("|", 3)
     
     message_ids, original_filename, thumbnail_file_id = [], "unknown.tmp", None
@@ -165,53 +175,33 @@ async def button_callback(client, callback_query: CallbackQuery):
             thumbnail_file_id = first_message.video.thumb.file_id
     except Exception as e:
         logger.error(f"Error getting file info: {e}")
-        await callback_query.answer(f"Error getting file info. It might have been deleted.", show_alert=True)
+        await callback_query.answer(f"Error getting file info.", show_alert=True)
         return
 
     user_settings = get_user_settings(user_id)
-    status_message = await callback_query.message.edit_text(f"✅ Job accepted...")
+    status_message = await callback_query.message.edit_text(f"✅ Job accepted, creating processing pipeline...")
     
-    task_args = (user_id, status_message.id, message_ids, quality, thumbnail_file_id, user_settings)
-    
-    task = celery_producer.send_task("worker.tasks.encode_video_task", args=task_args, queue=queue_type)
-    
-    add_job(task.id, user_id, original_filename, f"🕒 Pending in {queue_type}", status_message.id, task_args)
-
-
-@app.on_callback_query(filters.regex(r"^accelerate"))
-async def accelerate_callback(client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id not in ADMIN_USER_IDS: return
-
-    action, task_id_to_accelerate = callback_query.data.split("|", 1)
-    
-    job_to_accelerate = get_job(task_id_to_accelerate)
-    if not job_to_accelerate:
-        await callback_query.answer("Could not find this job.", show_alert=True)
-        return
-        
-    await callback_query.message.edit_text("✅ Re-routing to the high-priority accelerator lane...")
-
-    celery_producer.control.revoke(task_id_to_accelerate, terminate=True)
-    
-    original_task_args = job_to_accelerate["task_args"]
-    
-    new_task = celery_producer.send_task(
-        "worker.tasks.encode_video_task",
-        args=original_task_args,
-        kwargs={"original_task_id": task_id_to_accelerate},
-        queue='high_priority'
+    # Create the task chain
+    encode_pipeline = chain(
+        download_task.s(user_id, status_message.id, message_ids, quality, thumbnail_file_id, user_settings).set(queue='io_queue'),
+        encode_task.s().set(queue=f'cpu.{queue_type}') # Note: We need a way for encode_task to know its own final task_id
     )
     
-    update_job_status(task_id_to_accelerate, "⚡️ Accelerated")
-    await callback_query.message.edit_text(f"🚀 Job for `{job_to_accelerate['filename']}` is now accelerated!")
+    pipeline_result = encode_pipeline.apply_async()
+    
+    # Store the job using the ID of the first task in the chain
+    first_task_id = pipeline_result.id
+    add_job(first_task_id, user_id, original_filename, f"🕒 Pending Download", status_message.id, (user_id, status_message.id, message_ids, quality, thumbnail_file_id, user_settings))
 
 
-@app.on_callback_query(filters.regex(r"^cancel"))
+async def accelerate_callback(client, callback_query: CallbackQuery):
+    # This logic would need to be more complex, involving checking the state of the first task
+    # and potentially creating a new chain. For now, we keep the simpler model.
+    await callback_query.answer("Acceleration for the new pipeline model is under development.", show_alert=True)
+
+
 async def cancel_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
-    if user_id not in ADMIN_USER_IDS: return
-
     action, task_id_to_cancel = callback_query.data.split("|", 1)
     
     job_to_cancel = get_job(task_id_to_cancel)
@@ -219,27 +209,29 @@ async def cancel_callback(client, callback_query: CallbackQuery):
         await callback_query.answer("Could not find this job.", show_alert=True)
         return
     
+    # This will revoke the entire chain if the first task hasn't finished
     celery_producer.control.revoke(task_id_to_cancel, terminate=True)
+    # Also attempt to revoke the second task if its ID were known
+    
     remove_job(task_id_to_cancel)
     
     await callback_query.message.edit_text(f"✅ Job for `{job_to_cancel['filename']}` has been cancelled.")
     try:
         await client.edit_message_text(user_id, job_to_cancel['status_message_id'], "❌ Job Cancelled by User.")
     except Exception as e:
-        logger.warning(f"Could not edit original status message for cancelled job: {e}")
+        logger.warning(f"Could not edit original status message: {e}")
 
-@app.on_callback_query(filters.regex(r"^set_setting"))
 async def set_setting_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     action, key = callback_query.data.split("|", 1)
     user_states[user_id] = key
     
     prompts = {
-        "brand_name": "Please send your desired brand name (e.g., `MyEnc`).",
-        "website": "Please send your website or channel link (e.g., `t.me/MyChannel`).",
-        "custom_thumbnail_id": "Please send the photo you want to use as your permanent thumbnail."
+        "brand_name": "Please send your brand name.",
+        "website": "Please send your website link.",
+        "custom_thumbnail_id": "Please send a photo."
     }
-    await callback_query.message.reply_text(f"▶️ {prompts.get(key, 'Please send the new value.')}\n\nOr send /cancel to abort.")
+    await callback_query.message.reply_text(f"▶️ {prompts.get(key, 'Please send new value.')}\n\nOr send /cancel.")
     await callback_query.answer()
 
 @app.on_message(filters.text & filters.private)
@@ -248,7 +240,7 @@ async def handle_settings_text(client, message):
     state = user_states.get(user_id)
     if state in ["brand_name", "website"]:
         update_user_setting(user_id, state, message.text)
-        await message.reply_text(f"✅ `{state.replace('_', ' ').title()}` has been updated to: `{message.text}`")
+        await message.reply_text(f"✅ `{state.replace('_', ' ').title()}` updated.")
         del user_states[user_id]
         
 if __name__ == "__main__":
