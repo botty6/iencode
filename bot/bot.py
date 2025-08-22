@@ -32,6 +32,7 @@ pending_parts = defaultdict(lambda: {"message_ids": [], "timer": None})
 user_states = {} 
 app = Client("encoder_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp")
 
+
 # --- Keyboard Helper Functions ---
 def create_quality_keyboard(identifier):
     return InlineKeyboardMarkup([
@@ -47,7 +48,8 @@ def create_preset_keyboard(quality, identifier):
         [InlineKeyboardButton("🐌 Slow (Best)", callback_data=f"encode|{quality}|slow|{identifier}")]
     ])
 
-# --- Main Command Handlers ---
+
+# --- Main Command Handlers & Queue Logic ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
     if message.from_user.id in ADMIN_USER_IDS:
@@ -55,40 +57,34 @@ async def start_command(client, message):
     else:
         await message.reply_text("👋 Welcome!\nThis is a private bot. Contact the owner to get access.")
 
+async def show_queue(message_or_callback_query):
+    """Reusable function to display the main job queue."""
+    user_id = message_or_callback_query.from_user.id
+    jobs = database.get_user_jobs(user_id)
+    
+    if not jobs:
+        text = "📂 Your queue is empty!"
+        keyboard = None
+    else:
+        text = "📂 **Your Active Queue:**\n\n"
+        keyboard = []
+        for i, job in enumerate(jobs):
+            job_number = i + 1
+            text += f"**{job_number}️⃣ `{job['filename']}`**\n       Status: `{job['status']}`\n"
+            keyboard.append([InlineKeyboardButton(f"⚙️ Manage Job #{job_number}", callback_data=f"manage|{job['task_id']}")])
+        
+        keyboard.append([InlineKeyboardButton("🗑️ Cancel All Jobs", callback_data="cancel_all|user")])
+
+    # Determine if we need to edit an existing message or send a new one
+    if isinstance(message_or_callback_query, CallbackQuery):
+        await message_or_callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+    else:
+        await message_or_callback_query.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+
 @app.on_message(filters.command("queue") & filters.private)
 async def queue_command(client, message):
-    user_id = message.from_user.id
-    if user_id not in ADMIN_USER_IDS: return
-    
-    jobs = database.get_user_jobs(user_id)
-    if not jobs:
-        await message.reply_text("📂 Your queue is empty!")
-        return
-        
-    # --- REFACTORED: Queue Display Logic ---
-    queue_text = "📂 **Your Active Queue:**\n\n"
-    keyboard = []
-    
-    for i, job in enumerate(jobs):
-        job_number = i + 1
-        queue_text += f"**{job_number}️⃣ `{job['filename']}`**\nStatus: `{job['status']}`\n"
-        
-        action_buttons = []
-        # Add Cancel button for this specific job
-        action_buttons.append(InlineKeyboardButton(f"❌ Cancel #{job_number}", callback_data=f"cancel|{job['task_id']}"))
-        
-        # Add Accelerate button if the job is in the default queue
-        if job.get('job_data', {}).get('cpu_queue') == 'default':
-            action_buttons.append(InlineKeyboardButton(f"⚡️ Accelerate #{job_number}", callback_data=f"accelerate|{job['task_id']}"))
-        
-        # Add the row of buttons for this job
-        keyboard.append(action_buttons)
-    
-    # Add a "Cancel All" button at the end
-    if jobs:
-        keyboard.append([InlineKeyboardButton("🗑️ Cancel All Jobs", callback_data="cancel_all|user")])
-    
-    await message.reply_text(queue_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    if message.from_user.id not in ADMIN_USER_IDS: return
+    await show_queue(message)
 
 @app.on_message(filters.command("settings") & filters.private)
 async def settings_command(client, message):
@@ -165,11 +161,13 @@ def start_encode_pipeline(job_data: dict):
     )
     return pipeline.apply_async()
 
-@app.on_callback_query(filters.regex(r"^(quality|encode|accelerate|cancel|cancel_all|set_setting)"))
+@app.on_callback_query(filters.regex(r"^(quality|encode|manage|accelerate|cancel|cancel_all|set_setting|queue)"))
 async def callback_router(client, callback_query: CallbackQuery):
     action = callback_query.data.split("|")[0]
-    handlers = {"quality": quality_callback, "encode": encode_callback, "accelerate": accelerate_callback,
-                "cancel": cancel_callback, "cancel_all": cancel_all_callback, "set_setting": set_setting_callback}
+    handlers = {"quality": quality_callback, "encode": encode_callback, "manage": manage_job_callback,
+                "accelerate": accelerate_callback, "cancel": cancel_callback, 
+                "cancel_all": cancel_all_callback, "set_setting": set_setting_callback,
+                "queue": lambda c, cb: show_queue(cb)} # Route "queue" back to the main queue view
     handler = handlers.get(action)
     if handler: await handler(client, callback_query)
 
@@ -212,6 +210,32 @@ async def encode_callback(client, callback_query: CallbackQuery):
     
     if not identifier.isdigit(): del pending_parts[int(identifier)]
 
+async def manage_job_callback(client, callback_query: CallbackQuery):
+    """Shows a detailed management view for a single job."""
+    user_id = callback_query.from_user.id
+    action, task_id = callback_query.data.split("|", 1)
+    
+    job = database.get_job(task_id)
+    if not job or job['user_id'] != user_id:
+        await callback_query.answer("This job could not be found.", show_alert=True)
+        await show_queue(callback_query) # Refresh the queue view
+        return
+
+    text = (f"**Managing Job:** `{job['filename']}`\n"
+            f"**Status:** `{job['status']}`")
+            
+    keyboard = []
+    action_buttons = []
+    # Conditionally show the Accelerate button
+    if job.get('job_data', {}).get('cpu_queue') == 'default':
+        action_buttons.append(InlineKeyboardButton("⚡️ Accelerate", callback_data=f"accelerate|{task_id}"))
+    
+    action_buttons.append(InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{task_id}"))
+    keyboard.append(action_buttons)
+    keyboard.append([InlineKeyboardButton("⬅️ Back to Queue", callback_data="queue")])
+    
+    await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
 async def accelerate_callback(client, callback_query: CallbackQuery):
     await callback_query.answer("⚡️ Accelerating job...", show_alert=False)
     user_id = callback_query.from_user.id
@@ -220,13 +244,17 @@ async def accelerate_callback(client, callback_query: CallbackQuery):
     if not job or job['user_id'] != user_id:
         await callback_query.message.edit_text("Could not find this job or you don't own it.")
         return
+        
     celery_producer.control.revoke(task_id, terminate=False)
     job_data = job['job_data']
     job_data['cpu_queue'] = 'high_priority'
     new_result = start_encode_pipeline(job_data)
     database.remove_job(task_id)
     database.add_job(new_result.id, user_id, job['filename'], job['status_message_id'], job_data)
-    await callback_query.message.edit_text("✅ Job has been moved to the high-priority accelerator queue! The queue will update shortly.")
+    
+    await callback_query.message.edit_text("✅ Job has been moved to the high-priority accelerator queue!")
+    await asyncio.sleep(1)
+    await show_queue(callback_query)
 
 async def cancel_callback(client, callback_query: CallbackQuery):
     await callback_query.answer("❌ Cancelling job...", show_alert=False)
@@ -236,16 +264,20 @@ async def cancel_callback(client, callback_query: CallbackQuery):
     if not job or job['user_id'] != user_id:
         await callback_query.message.edit_text("Could not find this job or you don't own it.")
         return
+        
     celery_producer.control.revoke(task_id, terminate=True, signal='SIGKILL')
     database.update_job_status(task_id, "CANCELLED")
-    await callback_query.message.edit_text(f"✅ Job for `{job['filename']}` has been cancelled. The queue will update shortly.")
+    
+    await callback_query.message.edit_text(f"✅ Job for `{job['filename']}` has been cancelled.")
     try:
         await client.edit_message_text(user_id, job['status_message_id'], "❌ Job Cancelled by User.")
     except Exception as e:
         logger.warning(f"Could not edit original status message: {e}")
+    
+    await asyncio.sleep(1)
+    await show_queue(callback_query)
 
 async def cancel_all_callback(client, callback_query: CallbackQuery):
-    """NEW: Cancels all active jobs for the user."""
     user_id = callback_query.from_user.id
     await callback_query.answer("🗑️ Cancelling all jobs...", show_alert=False)
     
@@ -260,7 +292,7 @@ async def cancel_all_callback(client, callback_query: CallbackQuery):
         try:
             await client.edit_message_text(user_id, job['status_message_id'], "❌ Job Cancelled by User.")
         except Exception:
-            pass # Ignore if message is already gone
+            pass 
             
     await callback_query.message.edit_text("✅ All active jobs have been cancelled.")
 
@@ -288,4 +320,4 @@ if __name__ == "__main__":
     else:
         logger.info("Bot is starting...")
         app.run()
-    
+        
