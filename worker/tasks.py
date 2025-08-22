@@ -34,7 +34,6 @@ async def send_status_update(user_chat_id: int, message_text: str):
     app = Client(f"status_updater_{user_chat_id}", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, in_memory=True)
     async with app:
         try:
-            # For simplicity, we send a new message for retries instead of editing.
             await app.send_message(user_chat_id, message_text)
         except Exception as e:
             logging.error(f"Failed to send status update to {user_chat_id}: {e}")
@@ -86,7 +85,6 @@ async def _run_async_task(user_chat_id: int, list_of_message_ids: list, quality:
 
             video_info = get_video_info(input_path)
             if not video_info:
-                # This is a non-retryable error. The file is bad.
                 raise ValueError("Could not get video information from the file. It might be corrupt.")
 
             original_height = int(video_info.get("height", 0))
@@ -109,7 +107,6 @@ async def _run_async_task(user_chat_id: int, list_of_message_ids: list, quality:
             if process.returncode != 0:
                 error_log = process.stderr
                 logging.error(f"FFmpeg failed! Stderr:\n{error_log}")
-                # FFmpeg errors are generally not retryable.
                 raise RuntimeError("FFmpeg encountered an error during encoding. Check logs for details.")
 
             await status_message.edit_text(f"Uploading `{output_filename}`...")
@@ -123,19 +120,17 @@ async def _run_async_task(user_chat_id: int, list_of_message_ids: list, quality:
             await status_message.edit_text("🚀 Upload complete! Job finished.")
 
     except (ValueError, RuntimeError) as e:
-        # These are specific errors we've decided are not worth retrying.
         logging.error(f"Non-retryable error occurred: {e}")
         await app.send_message(user_chat_id, f"💥 A critical error occurred that cannot be retried:\n\n`{str(e)}`")
-        raise Ignore() # Tells Celery to stop and not retry this task.
+        raise Ignore()
     finally:
         await app.stop()
 
-# --- UPDATED: Celery task with retry logic ---
 @celery_app.task(
     name="worker.tasks.encode_video_task",
-    bind=True,  # Makes 'self' available to the task
+    bind=True,
     max_retries=3,
-    default_retry_delay=60  # Retry after 60 seconds
+    default_retry_delay=60
 )
 def encode_video_task(self, user_chat_id: int, list_of_message_ids: list, quality: str, thumbnail_file_id: str = None):
     try:
@@ -143,7 +138,6 @@ def encode_video_task(self, user_chat_id: int, list_of_message_ids: list, qualit
     except Exception as e:
         logging.warning(f"Task failed. Attempt {self.request.retries + 1} of {self.max_retries}. Retrying in {self.default_retry_delay}s. Error: {e}")
         
-        # Notify the user that a retry is happening
         retry_message = (
             f"⚠️ A temporary error occurred with your job. "
             f"Retrying in {self.default_retry_delay} seconds... "
@@ -151,5 +145,4 @@ def encode_video_task(self, user_chat_id: int, list_of_message_ids: list, qualit
         )
         asyncio.run(send_status_update(user_chat_id, retry_message))
         
-        # This tells Celery to retry the task. It will re-raise the exception.
         raise self.retry(exc=e)
