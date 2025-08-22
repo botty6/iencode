@@ -7,14 +7,13 @@ import glob
 import time
 import shutil
 from celery import Celery, chain
-from celery.exceptions import Ignore
 from kombu import Queue
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 from dotenv import load_dotenv
 from .utils import get_video_info, generate_thumbnail, generate_standard_filename, create_progress_bar, humanbytes
-# --- NEW: Import database functions directly into the worker ---
-from bot.database import update_job_status, get_job
+# --- CORRECT: Imports from the new top-level database module ---
+import database
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -26,7 +25,6 @@ API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 WORKERS = int(os.getenv("UPLOAD_WORKERS", 10)) 
 DOWNLOAD_CACHE_DIR = "/tmp/iencode_downloads"
-
 os.makedirs(DOWNLOAD_CACHE_DIR, exist_ok=True)
 
 DEFAULT_BRAND = os.getenv("BRANDING_TEXT", "MyEnc")
@@ -37,66 +35,45 @@ AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 if REDIS_URL.startswith("rediss://"):
     REDIS_URL = f"{REDIS_URL}?ssl_cert_reqs=CERT_NONE"
 
-# --- Celery App with HYBRID Queues ---
 celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
+celery_app.conf.task_queues = (Queue('io_queue', routing_key='io_queue'),
+                               Queue('default', routing_key='default'),
+                               Queue('high_priority', routing_key='high_priority'))
 
-celery_app.conf.task_queues = (
-    Queue('io_queue', routing_key='io_queue'),
-    Queue('default', routing_key='default'),
-    Queue('high_priority', routing_key='high_priority'),
-)
-
-# --- NEW: Abstract Base Task for State Management ---
+# --- Abstract Base Task for State Management ---
 class BaseTask(celery_app.Task):
     def on_failure(self, exc, task_id, args, kwargs, einfo):
-        """Handle task failure."""
         logging.error(f"Task {task_id} failed: {exc}")
-        update_job_status(task_id, "FAILED")
-        # You could add a Telegram notification here if desired
-
+        database.update_job_status(task_id, "FAILED")
     def on_success(self, retval, task_id, args, kwargs):
-        """Handle task success."""
-        # This is primarily for the final task in a chain.
-        job = get_job(task_id)
-        if job:
-            # Check if it's the final encode task
-            if self.name == 'worker.tasks.encode_task':
-                update_job_status(task_id, "COMPLETED")
+        job = database.get_job(task_id)
+        if job and self.name == 'worker.tasks.encode_task':
+            database.update_job_status(task_id, "COMPLETED")
 
 # --- TASK 1: I/O-Bound Download Task ---
 @celery_app.task(name="worker.tasks.download_task", bind=True, base=BaseTask)
 def download_task(self, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, preset: str, user_settings: dict):
-    """Synchronous wrapper for the async download and prep logic."""
-    update_job_status(self.request.id, "DOWNLOADING")
+    database.update_job_status(self.request.id, "DOWNLOADING")
     try:
         return asyncio.run(_run_download_and_prep(self.request.id, user_id, status_message_id, list_of_message_ids, quality, preset, user_settings))
     except Exception as e:
-        update_job_status(self.request.id, "FAILED")
-        # Manually trigger the on_failure handler by re-raising
+        database.update_job_status(self.request.id, "FAILED")
         raise e
 
 async def _run_download_and_prep(task_id: str, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, preset: str, user_settings: dict):
     app = Client(f"dl_{task_id}", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp", workers=WORKERS, in_memory=True)
     await app.start()
-    
     status_message = await app.get_messages(user_id, status_message_id)
     last_update_time = 0
-    
     job_cache_dir = os.path.join(DOWNLOAD_CACHE_DIR, task_id)
     os.makedirs(job_cache_dir, exist_ok=True)
     merged_input_path = os.path.join(job_cache_dir, "merged_input.mkv")
-
     try:
         messages = await app.get_messages(user_id, list_of_message_ids)
         if not isinstance(messages, list): messages = [messages]
-
-        first_message = messages[0]
-        file_meta = first_message.video or first_message.document
-        original_filename = getattr(file_meta, "file_name", "unknown_file.tmp")
-
+        original_filename = getattr(messages[0].video or messages[0].document, "file_name", "unknown_file.tmp")
         total_size = sum(getattr(m.video or m.document, "file_size", 0) for m in messages)
         if total_size == 0: raise ValueError("File size is 0 B.")
-
         start_time = time.time()
         current_size = 0
         with open(merged_input_path, "wb") as f:
@@ -104,7 +81,6 @@ async def _run_download_and_prep(task_id: str, user_id: int, status_message_id: 
                 async for chunk in app.stream_media(message):
                     f.write(chunk)
                     current_size += len(chunk)
-                    
                     now = time.time()
                     if now - last_update_time > 5:
                         last_update_time = now
@@ -114,85 +90,55 @@ async def _run_download_and_prep(task_id: str, user_id: int, status_message_id: 
                         text = (f"📥 **Downloading:** `{original_filename}`\n{progress_bar}\n"
                                 f"`{humanbytes(current_size)}` of `{humanbytes(total_size)}`\n"
                                 f"**Speed:** `{humanbytes(speed, speed=True)}`")
-                        try:
-                            await status_message.edit_text(text)
-                        except FloodWait as e:
-                            await asyncio.sleep(e.value)
+                        try: await status_message.edit_text(text)
+                        except FloodWait as e: await asyncio.sleep(e.value)
         
         await status_message.edit_text("🔬 Analyzing file and generating thumbnail...")
-        
         video_info = get_video_info(merged_input_path)
         if not video_info: raise ValueError("Could not get video info from the downloaded file.")
-        
         thumb_path = generate_thumbnail(merged_input_path, job_cache_dir)
-        
-        return {
-            "user_id": user_id, "status_message_id": status_message_id,
-            "input_path": merged_input_path, "job_cache_dir": job_cache_dir,
-            "original_filename": original_filename, "quality": quality,
-            "preset": preset,
-            "thumb_path": thumb_path,
-            "video_info": video_info,
-            "user_settings": user_settings
-        }
+        return {"user_id": user_id, "status_message_id": status_message_id, "input_path": merged_input_path, 
+                "job_cache_dir": job_cache_dir, "original_filename": original_filename, "quality": quality,
+                "preset": preset, "thumb_path": thumb_path, "video_info": video_info, "user_settings": user_settings}
     finally:
         await app.stop()
 
 @celery_app.task(name="worker.tasks.encode_task", bind=True, base=BaseTask)
 def encode_task(self, prep_data: dict):
-    """Synchronous wrapper for the async encode and upload logic."""
-    update_job_status(self.request.id, "ENCODING")
+    database.update_job_status(self.request.id, "ENCODING")
     try:
         return asyncio.run(_run_encode_and_upload(self.request.id, prep_data))
     except Exception as e:
-        update_job_status(self.request.id, "FAILED")
+        database.update_job_status(self.request.id, "FAILED")
         raise e
 
 async def _run_encode_and_upload(task_id: str, prep_data: dict):
     user_id = prep_data["user_id"]
     status_message_id = prep_data["status_message_id"]
-    
     app = Client(f"ul_{task_id}", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp", workers=WORKERS, in_memory=True)
     await app.start()
-
     status_message = await app.get_messages(user_id, status_message_id)
     last_update_time = 0
     job_cache_dir = prep_data["job_cache_dir"]
-    
     try:
         brand_name = prep_data["user_settings"].get("brand_name", DEFAULT_BRAND)
         website = prep_data["user_settings"].get("website", DEFAULT_WEBSITE)
-        
         total_duration_sec = float(prep_data["video_info"].get("duration", 0))
         original_height = int(prep_data["video_info"].get("height", 0))
-
-        if total_duration_sec <= 0:
-            raise ValueError("Video duration is invalid or zero. The file may be corrupt.")
-        if original_height <= 0:
-            raise ValueError("Could not determine video height. The file may be corrupt or not a video.")
-
+        if total_duration_sec <= 0: raise ValueError("Video duration is invalid or zero. The file may be corrupt.")
+        if original_height <= 0: raise ValueError("Could not determine video height. The file may be corrupt or not a video.")
         target_quality = int(prep_data["quality"])
-        if original_height > 0 and target_quality > original_height:
-            target_quality = original_height
-        
+        if original_height > 0 and target_quality > original_height: target_quality = original_height
         output_filename = generate_standard_filename(prep_data["original_filename"], str(target_quality), brand_name)
         output_path = os.path.join(job_cache_dir, output_filename)
-        
         encode_preset = prep_data.get("preset", "medium")
-
-        ffmpeg_command = [
-            "ffmpeg", "-i", prep_data["input_path"],
-            "-c:v", "libx265", "-preset", encode_preset, "-crf", ENCODE_CRF,
-            "-tune", "grain", "-pix_fmt", "yuv420p10le",
-            "-vf", f"scale=-2:{str(target_quality)}",
-            "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ac", "2",
-            "-metadata", f"encoder={brand_name}",
-            "-metadata", f"comment=Encoded by {brand_name} | Join us: {website}",
-            "-y", "-progress", "pipe:1", "-nostats", output_path
-        ]
+        ffmpeg_command = ["ffmpeg", "-i", prep_data["input_path"], "-c:v", "libx265", "-preset", encode_preset, 
+                          "-crf", ENCODE_CRF, "-tune", "grain", "-pix_fmt", "yuv420p10le", "-vf", f"scale=-2:{str(target_quality)}",
+                          "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ac", "2", "-metadata", f"encoder={brand_name}",
+                          "-metadata", f"comment=Encoded by {brand_name} | Join us: {website}", "-y", "-progress", "pipe:1",
+                          "-nostats", output_path]
         
         process = await asyncio.create_subprocess_exec(*ffmpeg_command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-
         while process.returncode is None:
             line_bytes = await process.stdout.readline()
             if not line_bytes: break
@@ -201,20 +147,16 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
                 try:
                     time_str = line.split("=")[1]
                     current_time_sec = int(time_str) / 1_000_000
-                except (ValueError, IndexError):
-                    continue
-                
+                except (ValueError, IndexError): continue
                 now = time.time()
                 if now - last_update_time > 5:
                     last_update_time = now
                     progress_bar = create_progress_bar(current_time_sec, total_duration_sec)
-                    text = (f"⚙️ **Encoding:** `{output_filename}`\n{progress_bar}")
-                    try:
-                        await status_message.edit_text(text)
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value)
+                    text = f"⚙️ **Encoding:** `{output_filename}`\n{progress_bar}"
+                    try: await status_message.edit_text(text)
+                    except FloodWait as e: await asyncio.sleep(e.value)
             await asyncio.sleep(0.1)
-
+        
         stdout_output, stderr_output = await process.communicate()
         if process.returncode != 0: 
             error_message = stderr_output.decode('utf-8').strip()
@@ -233,25 +175,18 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
                 progress_bar = create_progress_bar(current, total)
                 text = (f"📤 **Uploading:** `{output_filename}`\n{progress_bar}\n"
                         f"`{humanbytes(current)}` of `{humanbytes(total)}`")
-                try:
-                    await status_message.edit_text(text)
-                except FloodWait as e:
-                    await asyncio.sleep(e.value)
+                try: await status_message.edit_text(text)
+                except FloodWait as e: await asyncio.sleep(e.value)
         
         thumb_to_upload = None
         thumb_path_from_prep = prep_data.get("thumb_path")
         if thumb_path_from_prep and os.path.exists(thumb_path_from_prep) and os.path.getsize(thumb_path_from_prep) > 0:
             thumb_to_upload = thumb_path_from_prep
 
-        await app.send_document(
-            user_id, output_path,
-            caption=f"✅ Encode Complete!\n\n`{output_filename}`",
-            thumb=thumb_to_upload, progress=upload_progress
-        )
+        await app.send_document(user_id, output_path, caption=f"✅ Encode Complete!\n\n`{output_filename}`",
+                                thumb=thumb_to_upload, progress=upload_progress)
         await status_message.delete()
-        
     finally:
         await app.stop()
-        if os.path.exists(job_cache_dir):
-            shutil.rmtree(job_cache_dir)
+        if os.path.exists(job_cache_dir): shutil.rmtree(job_cache_dir)
             
