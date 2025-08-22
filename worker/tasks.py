@@ -50,10 +50,10 @@ celery_app.conf.task_queues = (
 def download_task(self, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict):
     """Synchronous wrapper for the async download and prep logic."""
     try:
-        return asyncio.run(_run_download_and_prep(self.request.id, user_id, status_message_id, list_of_message_s, quality, original_thumbnail_id, user_settings))
+        # --- THIS LINE IS NOW FIXED ---
+        return asyncio.run(_run_download_and_prep(self.request.id, user_id, status_message_id, list_of_message_ids, quality, original_thumbnail_id, user_settings))
     except Exception as e:
         logging.error(f"Download task {self.request.id} failed: {e}")
-        # In a real scenario, you might want to update the status in the DB here
         raise
 
 async def _run_download_and_prep(task_id: str, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict):
