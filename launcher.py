@@ -16,34 +16,53 @@ def run():
     
     print(f"✅ Detected {cpu_cores} CPU cores.")
 
-    # --- Intelligent Concurrency Logic ---
-    if cpu_cores <= 2: # Heroku-safe settings
+    # --- REFACTORED: Memory-Aware Concurrency Logic ---
+    
+    # Heroku dynos are memory-constrained. Check if we're running on Heroku.
+    IS_HEROKU = 'DYNO' in os.environ
+
+    if IS_HEROKU:
+        print("💡 Heroku environment detected. Using memory-safe concurrency settings.")
+        # On a 512MB dyno, we can only afford 1 CPU-intensive task at a time.
+        # We combine 'default' and 'high_priority' queues into a single worker.
         worker_concurrency = 1
-        accelerator_concurrency = 1
+        accelerator_concurrency = 0 # Accelerator is disabled to save memory
     elif cpu_cores <= 4:
+        # Settings for small VPS
         worker_concurrency = 1
         accelerator_concurrency = cpu_cores - 1
     else:
+        # Settings for powerful servers
         worker_concurrency = max(2, cpu_cores // 4)
         accelerator_concurrency = cpu_cores - worker_concurrency
 
     # Gevent concurrency is for I/O, can be high
-    io_worker_concurrency = os.getenv("IO_WORKER_CONCURRENCY", "100")
+    io_worker_concurrency = os.getenv("IO_WORKER_CONCURRENCY", "50") # Reduced for Heroku safety
 
     print("🚀 Launching with HYBRID pool configuration:")
     print(f"   - Bot Listener: 1 process")
     print(f"   - I/O Worker (Gevent): {io_worker_concurrency} concurrency")
-    print(f"   - Standard CPU Worker (Prefork): {worker_concurrency} cores")
-    print(f"   - Accelerator CPU Worker (Prefork): {accelerator_concurrency} cores")
+    
+    if IS_HEROKU:
+        print(f"   - Combined CPU Worker (Prefork): {worker_concurrency} core(s)")
+    else:
+        print(f"   - Standard CPU Worker (Prefork): {worker_concurrency} cores")
+        print(f"   - Accelerator CPU Worker (Prefork): {accelerator_concurrency} cores")
     print("-" * 30)
 
-    # --- UPDATED: Added unique node names (-n) to each worker ---
     commands = {
         "bot": "python bot/bot.py",
         "io_worker": f"celery -A worker.tasks worker --loglevel=info -Q io_queue -P gevent -c {io_worker_concurrency} -n io_worker@%h",
-        "worker": f"celery -A worker.tasks worker --loglevel=info -Q default -P prefork -c {worker_concurrency} -n worker@%h",
-        "accelerator": f"celery -A worker.tasks worker --loglevel=info -Q high_priority -P prefork -c {accelerator_concurrency} -n accelerator@%h"
     }
+    
+    if IS_HEROKU:
+        # On Heroku, a single worker handles both queues to save RAM.
+        commands["worker"] = f"celery -A worker.tasks worker --loglevel=info -Q default,high_priority -P prefork -c {worker_concurrency} -n cpu_worker@%h"
+    else:
+        # On a VPS, we can afford separate workers.
+        commands["worker"] = f"celery -A worker.tasks worker --loglevel=info -Q default -P prefork -c {worker_concurrency} -n worker@%h"
+        if accelerator_concurrency > 0:
+            commands["accelerator"] = f"celery -A worker.tasks worker --loglevel=info -Q high_priority -P prefork -c {accelerator_concurrency} -n accelerator@%h"
 
     processes = {}
     try:
@@ -75,3 +94,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+    
