@@ -23,8 +23,6 @@ ADMIN_USER_IDS = [int(uid.strip()) for uid in os.getenv("ADMIN_USER_IDS", "").sp
 
 # --- State Management ---
 pending_parts = defaultdict(lambda: {"message_ids": [], "timer": None})
-# --- NEW: In-memory queue to track job status ---
-# Format: {user_id: {message_id: {"filename": "...", "status": "..."}}}
 active_jobs = defaultdict(dict)
 
 
@@ -47,11 +45,12 @@ async def trigger_encode_job(user_id: int, original_message: Message):
 
 def create_quality_keyboard(identifier):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ 720p", callback_data=f"encode|720|{identifier}")],
+        [InlineKeyboardButton("✅ 720p (Standard)", callback_data=f"encode|720|{identifier}|default")],
         [
-            InlineKeyboardButton("🚀 1080p", callback_data=f"encode|1080|{identifier}"),
-            InlineKeyboardButton("💾 480p", callback_data=f"encode|480|{identifier}"),
-        ]
+            InlineKeyboardButton("🚀 1080p (Standard)", callback_data=f"encode|1080|{identifier}|default"),
+            InlineKeyboardButton("💾 480p (Standard)", callback_data=f"encode|480|{identifier}|default"),
+        ],
+        [InlineKeyboardButton("⚡️ Accelerate This Job (720p High Priority)", callback_data=f"encode|720|{identifier}|high_priority")]
     ])
 
 # --- Handlers ---
@@ -62,7 +61,6 @@ async def start_command(client, message):
     else:
         await message.reply_text("👋 Welcome!\nThis is a private bot and you are not authorized to use it.")
 
-# --- NEW: Queue command ---
 @app.on_message(filters.command("queue") & filters.private)
 async def queue_command(client, message):
     user_id = message.from_user.id
@@ -114,8 +112,10 @@ async def button_callback(client, callback_query: CallbackQuery):
         await callback_query.answer("🚫 You are not authorized.", show_alert=True)
         return
         
-    action, quality, identifier = callback_query.data.split("|", 2)
+    action, quality, identifier, queue_type = callback_query.data.split("|", 3)
+    
     message_ids = []
+    job_type = ""
     
     try:
         message_ids = [int(identifier)]
@@ -145,17 +145,14 @@ async def button_callback(client, callback_query: CallbackQuery):
     except Exception as e:
         logger.warning(f"Could not retrieve message details for {message_ids[0]}: {e}")
 
-    # --- NEW: Add job to queue and send it to worker ---
-    status_message = await callback_query.message.edit_text("✅ Job accepted. Sending to the processing queue...")
+    status_message = await callback_query.message.edit_text(f"✅ Job accepted. Sending to the **{queue_type.replace('_', ' ')}** queue...")
     
-    active_jobs[user_id][status_message.id] = {"filename": original_filename, "status": "🕒 Pending"}
+    active_jobs[user_id][status_message.id] = {"filename": original_filename, "status": f"🕒 Pending in {queue_type.replace('_', ' ')}"}
     
-    encode_video_task.delay(
-        user_chat_id=callback_query.message.chat.id,
-        status_message_id=status_message.id, # Pass the status message ID to the worker
-        list_of_message_ids=message_ids,
-        quality=quality,
-        thumbnail_file_id=thumbnail_file_id
+    encode_video_task.apply_async(
+        args=[user_id, status_message.id, message_ids, quality, thumbnail_file_id],
+        kwargs={},
+        queue=queue_type
     )
 
 # --- Simplified Main Entrypoint ---
