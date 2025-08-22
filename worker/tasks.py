@@ -50,7 +50,7 @@ celery_app.conf.task_queues = (
 def download_task(self, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict):
     """Synchronous wrapper for the async download and prep logic."""
     try:
-        return asyncio.run(_run_download_and_prep(self.request.id, user_id, status_message_id, list_of_message_ids, quality, original_thumbnail_id, user_settings))
+        return asyncio.run(_run_download_and_prep(self.request.id, user_id, status_message_id, list_of_message_s, quality, original_thumbnail_id, user_settings))
     except Exception as e:
         logging.error(f"Download task {self.request.id} failed: {e}")
         # In a real scenario, you might want to update the status in the DB here
@@ -156,7 +156,7 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
         brand_name = prep_data["user_settings"].get("brand_name", DEFAULT_BRAND)
         website = prep_data["user_settings"].get("website", DEFAULT_WEBSITE)
         
-        # --- START: NEW GUARD CLAUSE ---
+        # --- START: GUARD CLAUSE ---
         total_duration_sec = float(prep_data["video_info"].get("duration", 0))
         original_height = int(prep_data["video_info"].get("height", 0))
 
@@ -164,7 +164,7 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
             raise ValueError("Video duration is invalid or zero. The file may be corrupt.")
         if original_height <= 0:
             raise ValueError("Could not determine video height. The file may be corrupt or not a video.")
-        # --- END: NEW GUARD CLAUSE ---
+        # --- END: GUARD CLAUSE ---
 
         target_quality = int(prep_data["quality"])
         if original_height > 0 and target_quality > original_height:
