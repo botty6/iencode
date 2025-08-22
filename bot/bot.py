@@ -11,7 +11,8 @@ from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from .database import get_user_settings, update_user_setting, add_job, get_job, remove_job, get_user_jobs
+# --- CRITICAL FIX: Changed from relative to absolute import ---
+from database import get_user_settings, update_user_setting, add_job, get_job, remove_job, get_user_jobs
 
 # --- Configuration & Initializations ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -29,7 +30,7 @@ if REDIS_URL.startswith("rediss://"):
 celery_producer = Celery('producer', broker=REDIS_URL)
 
 pending_parts = defaultdict(lambda: {"message_ids": [], "timer": None})
-user_states = {} # For tracking if user is in a 'set_setting' state
+user_states = {} 
 
 app = Client("encoder_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp")
 
@@ -98,7 +99,7 @@ async def settings_command(client, message):
     await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 # --- Main File Handler ---
-@app.on_message((filters.video | filters.document) & filters.private)
+@app.on_message((filters.video | filters.document | filters.photo) & filters.private)
 async def main_file_handler(client, message: Message):
     user_id = message.from_user.id
     if user_id not in ADMIN_USER_IDS: return
@@ -110,14 +111,14 @@ async def main_file_handler(client, message: Message):
             await message.reply_text("✅ Thumbnail updated successfully!")
             del user_states[user_id]
         else:
-            await message.reply_text("That's not a photo. Please send an image to set as your thumbnail.")
+            await message.reply_text("That's not a photo. Please send an image to set as your thumbnail, or /cancel.")
         return
     
     # Otherwise, handle it as a new video file
-    await handle_video(client, message)
+    if message.video or message.document:
+        await handle_video(client, message)
 
 async def handle_video(client, message: Message):
-    # ... (handle_video logic from previous version is unchanged) ...
     user_id = message.from_user.id
     file = message.video or message.document
     file_name = getattr(file, "file_name", "unknown_file.tmp")
@@ -135,7 +136,6 @@ async def handle_video(client, message: Message):
 # --- Callback Handlers ---
 @app.on_callback_query(filters.regex(r"^encode"))
 async def button_callback(client, callback_query: CallbackQuery):
-    # ... (button_callback logic is the same, but now passes settings dict) ...
     user_id = callback_query.from_user.id
     if user_id not in ADMIN_USER_IDS: return
 
@@ -157,7 +157,8 @@ async def button_callback(client, callback_query: CallbackQuery):
         if first_message.video and first_message.video.thumb:
             thumbnail_file_id = first_message.video.thumb.file_id
     except Exception as e:
-        # ... error handling ...
+        logger.error(f"Error getting file info: {e}")
+        await callback_query.answer(f"Error getting file info. It might have been deleted.", show_alert=True)
         return
 
     user_settings = get_user_settings(user_id)
@@ -172,7 +173,6 @@ async def button_callback(client, callback_query: CallbackQuery):
 
 @app.on_callback_query(filters.regex(r"^accelerate"))
 async def accelerate_callback(client, callback_query: CallbackQuery):
-    # ... (accelerate_callback logic is the same, but uses DB) ...
     user_id = callback_query.from_user.id
     if user_id not in ADMIN_USER_IDS: return
 
@@ -197,7 +197,7 @@ async def accelerate_callback(client, callback_query: CallbackQuery):
     add_job(new_task.id, user_id, job_to_accelerate['filename'], "⚡️ Accelerated", new_status_message.id, new_task_args)
     
     try:
-        await client.edit_message_text(user_id, job_to_accelerate['status_message_id'], "This job has been accelerated.")
+        await client.edit_message_text(user_id, job_to_accelerate['status_message_id'], "This job has been accelerated and is now tracked in a new message.")
     except Exception as e:
         logger.warning(f"Could not edit original status message: {e}")
 
@@ -209,11 +209,11 @@ async def set_setting_callback(client, callback_query: CallbackQuery):
     user_states[user_id] = key
     
     prompts = {
-        "brand_name": "Please send your desired brand name.",
-        "website": "Please send your website or channel link.",
-        "custom_thumbnail_id": "Please send the photo you want to use as a thumbnail."
+        "brand_name": "Please send your desired brand name (e.g., `MyEnc`).",
+        "website": "Please send your website or channel link (e.g., `t.me/MyChannel`).",
+        "custom_thumbnail_id": "Please send the photo you want to use as your permanent thumbnail."
     }
-    await callback_query.message.reply_text(prompts.get(key, "Please send the new value."))
+    await callback_query.message.reply_text(f"▶️ {prompts.get(key, 'Please send the new value.')}\n\nOr send /cancel to abort.")
     await callback_query.answer()
 
 # Handler for text messages to capture settings
@@ -223,8 +223,16 @@ async def handle_settings_text(client, message):
     state = user_states.get(user_id)
     if state in ["brand_name", "website"]:
         update_user_setting(user_id, state, message.text)
-        await message.reply_text(f"✅ {state.replace('_', ' ').title()} updated successfully!")
+        await message.reply_text(f"✅ `{state.replace('_', ' ').title()}` has been updated to: `{message.text}`")
         del user_states[user_id]
+        
+@app.on_message(filters.command("cancel") & filters.private)
+async def cancel_command(client, message):
+    user_id = message.from_user.id
+    if user_id in user_states:
+        del user_states[user_id]
+        await message.reply_text("Action canceled.")
+
 
 # --- Main Entrypoint ---
 if __name__ == "__main__":
