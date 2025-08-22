@@ -56,3 +56,22 @@ def generate_standard_filename(original_filename: str, quality: str, brand: str)
     base_name = ".".join(filtered_parts)
     
     return f"{base_name}-[{brand}].mkv"
+
+def create_progress_bar(current, total, bar_length=20):
+    """Creates a text-based progress bar string."""
+    percent = float(current) * 100 / float(total)
+    arrow = '█' * int(percent/100 * bar_length)
+    spaces = '░' * (bar_length - len(arrow))
+    return f"[{arrow}{spaces}] {percent:.2f}%"
+
+def humanbytes(size):
+    """Converts bytes to a human-readable format."""
+    if not size:
+        return ""
+    power = 2**10
+    n = 0
+    power_labels = {0: '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
+    while size > power:
+        size /= power
+        n += 1
+    return f"{size:.2f} {power_labels[n]}B"
