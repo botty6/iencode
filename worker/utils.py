@@ -37,12 +37,10 @@ def get_video_info(input_path: str):
             logging.warning(f"No video stream found in {input_path}")
             return None
 
-        # --- START: VALIDATION BLOCK ---
         duration_str = video_stream.get("duration")
         if not duration_str:
             duration_str = info.get("format", {}).get("duration")
 
-        # Clean and validate critical numeric values
         try:
             video_stream['duration'] = float(duration_str)
         except (ValueError, TypeError):
@@ -52,12 +50,50 @@ def get_video_info(input_path: str):
             video_stream['height'] = int(video_stream.get("height"))
         except (ValueError, TypeError):
             video_stream['height'] = 0
-        # --- END: VALIDATION BLOCK ---
         
         return video_stream
         
     except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
         logging.error(f"Error getting video info for {input_path}: {e}")
+        return None
+
+def generate_thumbnail(video_path: str, job_cache_dir: str) -> str | None:
+    """
+    Generates a validated thumbnail from the video file.
+    Returns the thumbnail path on success, or None on failure.
+    """
+    thumb_path = os.path.join(job_cache_dir, "thumb.jpg")
+    
+    # Take a frame at 10% into the video, scale to 320px width, write JPEG
+    command = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-ss", "1", "-frames:v", "1",
+        "-vf", "scale=320:-1",
+        thumb_path
+    ]
+    
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+        # Validate that the thumbnail exists, is not empty, and is under 200KB
+        if not os.path.exists(thumb_path):
+            return None
+            
+        file_size = os.path.getsize(thumb_path)
+        if file_size > 0 and file_size <= 200 * 1024:
+            return thumb_path
+        else:
+            os.remove(thumb_path) # Clean up invalid file
+            return None
+            
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
+        logging.error(f"Thumbnail generation failed: {e}")
         return None
 
 def generate_standard_filename(original_filename: str, quality: str, brand: str) -> str:
@@ -96,6 +132,7 @@ def generate_standard_filename(original_filename: str, quality: str, brand: str)
 
 def create_progress_bar(current, total, bar_length=20):
     """Creates a text-based progress bar string."""
+    if total == 0: return f"[{'░' * bar_length}] 0.00%"
     percent = float(current) * 100 / float(total)
     arrow = '█' * int(percent/100 * bar_length)
     spaces = '░' * (bar_length - len(arrow))
@@ -105,12 +142,13 @@ def humanbytes(size, speed=False):
     """Converts bytes to a human-readable format, optionally as a speed."""
     if not size:
         return ""
-    power = 1024 # Use 1024 for storage/speed
+    power = 1024
     n = 0
     power_labels = {0: '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
-    while size > power:
+    while size >= power:
         size /= power
         n += 1
     
     suffix = 'B/s' if speed else 'B'
     return f"{size:.2f} {power_labels[n]}{suffix}"
+    
