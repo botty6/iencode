@@ -7,7 +7,7 @@ from celery import Celery
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 from dotenv import load_dotenv
-from .utils import get_video_info, generate_standard_filename # <-- IMPORT the new function
+from .utils import get_video_info, generate_standard_filename
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -19,6 +19,12 @@ API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 BRANDING_TEXT = os.getenv("BRANDING_TEXT", "MyEnc")
 
+# --- NEW: Configurable Encoding Settings ---
+# These can be changed via environment variables without touching the code.
+ENCODE_PRESET = os.getenv("ENCODE_PRESET", "slow")  # e.g., ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+ENCODE_CRF = os.getenv("ENCODE_CRF", "24")          # Constant Rate Factor (CRF). Lower is better quality, higher is smaller file. 18-28 is a good range.
+AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")  # e.g., 96k, 128k, 192k, 256k
+
 if REDIS_URL.startswith("rediss://"):
     REDIS_URL = f"{REDIS_URL}?ssl_cert_reqs=CERT_NONE"
 celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
@@ -29,7 +35,7 @@ async def _run_async_task(user_chat_id: int, message_id: int, quality: str):
     await app.start()
     
     status_message = await app.send_message(user_chat_id, "⚙️ Job started. Preparing to download...")
-    output_filename = "encoded_output.mkv" # Default filename in case of error
+    original_filename = "unknown_file.tmp" # Default filename in case of error
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -37,7 +43,6 @@ async def _run_async_task(user_chat_id: int, message_id: int, quality: str):
             
             message = await app.get_messages(user_chat_id, message_id)
             
-            # --- NEW: Get original filename for renaming ---
             file_meta = message.video or message.document
             original_filename = getattr(file_meta, "file_name", "unknown_file.tmp")
 
@@ -66,20 +71,20 @@ async def _run_async_task(user_chat_id: int, message_id: int, quality: str):
             
             final_quality_str = str(target_quality)
             
-            # --- NEW: Generate the standardized filename ---
             output_filename = generate_standard_filename(original_filename, final_quality_str, BRANDING_TEXT)
             output_path = os.path.join(temp_dir, output_filename)
 
             await status_message.edit_text(f"✅ Analysis complete! Starting encode for `{output_filename}`...")
             
+            # --- UPDATED: FFmpeg command now uses configurable settings ---
             ffmpeg_command = [
                 "ffmpeg", "-i", input_path,
                 "-c:v", "libx265",
-                "-preset", "slow",
-                "-crf", "24",
+                "-preset", ENCODE_PRESET,
+                "-crf", ENCODE_CRF,
                 "-vf", f"scale=-2:{final_quality_str}",
                 "-c:a", "aac",
-                "-b:a", "128k",
+                "-b:a", AUDIO_BITRATE,
                 "-metadata", f"encoder={BRANDING_TEXT}",
                 "-y", output_path
             ]
@@ -99,7 +104,6 @@ async def _run_async_task(user_chat_id: int, message_id: int, quality: str):
                     except FloodWait as e:
                         await asyncio.sleep(e.value)
             
-            # --- NEW: Use the new filename in the caption ---
             await app.send_document(
                 user_chat_id,
                 output_path,
