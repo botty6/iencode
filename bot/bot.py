@@ -21,17 +21,18 @@ API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 ADMIN_USER_IDS = [int(uid.strip()) for uid in os.getenv("ADMIN_USER_IDS", "").split(",") if uid.strip()]
 
-# --- State Management for Multi-part Uploads ---
+# --- State Management ---
 pending_parts = defaultdict(lambda: {"message_ids": [], "timer": None})
+# --- NEW: In-memory queue to track job status ---
+# Format: {user_id: {message_id: {"filename": "...", "status": "..."}}}
+active_jobs = defaultdict(dict)
+
 
 # --- Pyrogram Client Initialization ---
 app = Client("encoder_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp")
 
 async def trigger_encode_job(user_id: int, original_message: Message):
-    """
-    Waits for a timeout, then gathers all parts and presents the encoding options.
-    """
-    await asyncio.sleep(30) # Wait 30 seconds for more parts
+    await asyncio.sleep(30) 
 
     user_data = pending_parts.get(user_id)
     if not user_data or not user_data["message_ids"]:
@@ -45,7 +46,6 @@ async def trigger_encode_job(user_id: int, original_message: Message):
     user_data["timer"] = None
 
 def create_quality_keyboard(identifier):
-    """Helper to create the keyboard, using user_id for multi-part or message_id for single files."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ 720p", callback_data=f"encode|720|{identifier}")],
         [
@@ -58,9 +58,27 @@ def create_quality_keyboard(identifier):
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(client, message):
     if message.from_user.id in ADMIN_USER_IDS:
-        await message.reply_text("👋 Hello! Send me a video file or split parts to get started.")
+        await message.reply_text("👋 Hello! Send me a video file or split parts to get started.\nYou can use /queue to see your active jobs.")
     else:
         await message.reply_text("👋 Welcome!\nThis is a private bot and you are not authorized to use it.")
+
+# --- NEW: Queue command ---
+@app.on_message(filters.command("queue") & filters.private)
+async def queue_command(client, message):
+    user_id = message.from_user.id
+    if user_id not in ADMIN_USER_IDS:
+        return
+    
+    jobs = active_jobs.get(user_id)
+    if not jobs:
+        await message.reply_text("📂 Your queue is empty!")
+        return
+        
+    queue_text = "📂 **Your Active Queue:**\n\n"
+    for i, (msg_id, job) in enumerate(jobs.items()):
+        queue_text += f"{i+1}️⃣ `{job['filename']}` → **{job['status']}**\n"
+        
+    await message.reply_text(queue_text)
 
 @app.on_message((filters.video | filters.document) & filters.private)
 async def handle_video(client, message: Message):
@@ -75,23 +93,18 @@ async def handle_video(client, message: Message):
 
     if is_split_file:
         user_data = pending_parts[user_id]
-        
         if user_data["timer"]:
             user_data["timer"].cancel()
-            
         user_data["message_ids"].append(message.id)
         
         await message.reply_text(
-            f"👍 Received part: `{file_name}`\n"
-            f"Total parts collected: {len(user_data['message_ids'])}. "
-            f"I will wait 30 seconds for the next part before asking to encode.",
+            f"👍 Part `{file_name}` collected. Total: {len(user_data['message_ids'])}. Waiting 30s for more parts.",
             quote=True
         )
-        
         user_data["timer"] = asyncio.create_task(trigger_encode_job(user_id, message))
     else:
         keyboard = create_quality_keyboard(message.id)
-        await message.reply_text(f"🎬 Received file: `{file_name}`\nPlease choose an output quality:", reply_markup=keyboard)
+        await message.reply_text(f"🎬 Received: `{file_name}`\nPlease choose an output quality:", reply_markup=keyboard)
 
 
 @app.on_callback_query(filters.regex(r"^encode"))
@@ -102,7 +115,6 @@ async def button_callback(client, callback_query: CallbackQuery):
         return
         
     action, quality, identifier = callback_query.data.split("|", 2)
-    
     message_ids = []
     
     try:
@@ -115,27 +127,32 @@ async def button_callback(client, callback_query: CallbackQuery):
             job_type = f"{len(message_ids)}-part job"
             del pending_parts[int(identifier)]
         else:
-            await callback_query.answer("Error: Could not find the file parts for this job.", show_alert=True)
+            await callback_query.answer("Error: Could not find job parts.", show_alert=True)
             return
 
     if not message_ids:
-        await callback_query.answer("Error: No files found for this job.", show_alert=True)
+        await callback_query.answer("Error: No files found.", show_alert=True)
         return
 
     thumbnail_file_id = None
+    original_filename = "unknown_file.tmp"
     try:
         first_message = await client.get_messages(user_id, message_ids[0])
+        file_meta = first_message.video or first_message.document
+        original_filename = getattr(file_meta, "file_name", "unknown_file.tmp")
         if first_message.video and first_message.video.thumb:
             thumbnail_file_id = first_message.video.thumb.file_id
-            logger.info(f"Found thumbnail with file_id: {thumbnail_file_id} for job.")
     except Exception as e:
-        logger.warning(f"Could not retrieve thumbnail for message {message_ids[0]}: {e}")
+        logger.warning(f"Could not retrieve message details for {message_ids[0]}: {e}")
 
-    await callback_query.answer("✅ Job sent to queue!")
-    await callback_query.message.edit_text(f"⏳ Your {job_type} is now in the queue for a {quality}p encode...")
+    # --- NEW: Add job to queue and send it to worker ---
+    status_message = await callback_query.message.edit_text("✅ Job accepted. Sending to the processing queue...")
+    
+    active_jobs[user_id][status_message.id] = {"filename": original_filename, "status": "🕒 Pending"}
     
     encode_video_task.delay(
         user_chat_id=callback_query.message.chat.id,
+        status_message_id=status_message.id, # Pass the status message ID to the worker
         list_of_message_ids=message_ids,
         quality=quality,
         thumbnail_file_id=thumbnail_file_id
