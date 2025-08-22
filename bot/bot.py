@@ -125,10 +125,8 @@ async def button_callback(client, callback_query: CallbackQuery):
         await callback_query.answer("Error: No files found for this job.", show_alert=True)
         return
 
-    # --- NEW: Thumbnail Detection Logic ---
     thumbnail_file_id = None
     try:
-        # We check the first message in the list for a thumbnail
         first_message = await client.get_messages(user_id, message_ids[0])
         if first_message.video and first_message.video.thumb:
             thumbnail_file_id = first_message.video.thumb.file_id
@@ -139,12 +137,11 @@ async def button_callback(client, callback_query: CallbackQuery):
     await callback_query.answer("✅ Job sent to queue!")
     await callback_query.message.edit_text(f"⏳ Your {job_type} is now in the queue for a {quality}p encode...")
     
-    # --- UPDATED: Pass thumbnail_file_id to the worker task ---
     encode_video_task.delay(
         user_chat_id=callback_query.message.chat.id,
         list_of_message_ids=message_ids,
         quality=quality,
-        thumbnail_file_id=thumbnail_file_id # Can be None
+        thumbnail_file_id=thumbnail_file_id
     )
 
 # --- Main Entrypoint ---
