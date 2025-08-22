@@ -22,7 +22,6 @@ API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 ADMIN_USER_IDS = [int(uid.strip()) for uid in os.getenv("ADMIN_USER_IDS", "").split(",") if uid.strip()]
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# --- CRITICAL FIX: Add Heroku Redis SSL configuration ---
 if REDIS_URL.startswith("rediss://"):
     REDIS_URL = f"{REDIS_URL}?ssl_cert_reqs=CERT_NONE"
 
@@ -43,7 +42,6 @@ async def trigger_encode_job(user_id: int, original_message: Message):
     await original_message.reply_text( f"✅ Received {len(user_data['message_ids'])} parts. Choose quality:", reply_markup=create_new_job_keyboard(user_id))
     user_data["timer"] = None
 
-# --- REFACTORED: Separate keyboard for new jobs ---
 def create_new_job_keyboard(identifier):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ 720p (Standard)", callback_data=f"encode|720|{identifier}|default")],
@@ -73,9 +71,16 @@ async def queue_command(client, message):
         
     keyboard = []
     queue_text = "📂 **Your Active Queue:**\n\n"
-    for i, (msg_id, job) in enumerate(jobs.items()):
+    # Filter out completed/errored jobs before display
+    current_active_jobs = {msg_id: job for msg_id, job in jobs.items() if "Pending" in job.get("status", "") or "Accelerated" in job.get("status", "")}
+    active_jobs[user_id] = current_active_jobs
+
+    if not current_active_jobs:
+        await message.reply_text("📂 Your queue is empty!")
+        return
+
+    for i, (msg_id, job) in enumerate(current_active_jobs.items()):
         queue_text += f"{i+1}️⃣ `{job['filename']}` → **{job['status']}**\n"
-        # Only show accelerate button for jobs pending in the default queue
         if job.get('status') == "🕒 Pending in default":
             keyboard.append([InlineKeyboardButton(f"⚡️ Accelerate Job #{i+1}", callback_data=f"accelerate|{job['task_id']}")])
     
@@ -95,7 +100,6 @@ async def handle_video(client, message: Message):
         await message.reply_text(f"👍 Part `{file_name}` collected. Total: {len(user_data['message_ids'])}.", quote=True)
         user_data["timer"] = asyncio.create_task(trigger_encode_job(user_id, message))
     else:
-        # Use the correct keyboard for new files
         await message.reply_text(f"🎬 Received: `{file_name}`\nPlease choose quality:", reply_markup=create_new_job_keyboard(message.id))
 
 
@@ -166,27 +170,47 @@ async def accelerate_callback(client, callback_query: CallbackQuery):
         await callback_query.answer("Could not find this job. It may have started.", show_alert=True)
         return
         
-    await callback_query.message.edit_text("✅ Found job! Accelerating now...")
+    # --- NEW: UI Conflict Fix ---
+    # 1. The message from the /queue command is now the new status message
+    new_status_message = callback_query.message
+    await new_status_message.edit_text("✅ Found job! Accelerating now...")
 
+    # 2. Revoke the original task
     celery_producer.control.revoke(task_id_to_accelerate)
     
+    # 3. Update the task arguments to point to the NEW status message
+    original_task_args = job_to_accelerate["task_args"]
+    new_task_args = (original_task_args[0], new_status_message.id, *original_task_args[2:])
+    
+    # 4. Re-submit the task to the high_priority queue
     new_task = celery_producer.send_task(
         "worker.tasks.encode_video_task",
-        args=job_to_accelerate["task_args"],
+        args=new_task_args,
         queue='high_priority'
     )
     
-    job_to_accelerate['status'] = "⚡️ Accelerated"
-    job_to_accelerate['task_id'] = new_task.id
+    # 5. Update the job dictionary
+    # Remove the old job entry
+    del active_jobs[user_id][original_msg_id] 
+    # Add the new job entry, keyed by the new status message id
+    active_jobs[user_id][new_status_message.id] = {
+        "filename": job_to_accelerate['filename'],
+        "status": "⚡️ Accelerated & Re-queued",
+        "task_id": new_task.id,
+        "task_args": new_task_args
+    }
     
-    await callback_query.message.edit_text(f"🚀 Job for `{job_to_accelerate['filename']}` moved to the high-priority queue!")
+    # 6. (Optional) Clean up the original status message
+    try:
+        await client.edit_message_text(user_id, original_msg_id, "This job has been accelerated.")
+    except Exception as e:
+        logger.warning(f"Could not edit original status message {original_msg_id}: {e}")
 
 
-# --- Simplified Main Entrypoint ---
+# --- Main Entrypoint ---
 if __name__ == "__main__":
     if not all([BOT_TOKEN, API_ID, API_HASH, ADMIN_USER_IDS]):
         logger.critical("CRITICAL: One or more environment variables are missing!")
     else:
         logger.info("Bot is starting...")
         app.run()
-        logger.info("Bot has stopped.")
