@@ -7,20 +7,13 @@ import os
 def get_video_info(input_path: str):
     """
     Uses ffprobe to get detailed information about a video file, including a reliable duration.
-    
-    Args:
-        input_path: The path to the video file.
-        
-    Returns:
-        A dictionary containing video stream information and a reliable duration, or None.
     """
-    # --- UPDATED: Add -show_format to get container-level metadata ---
     ffprobe_command = [
         "ffprobe",
         "-v", "quiet",
         "-print_format", "json",
         "-show_streams",
-        "-show_format", # This is the key change
+        "-show_format",
         input_path
     ]
     
@@ -44,15 +37,11 @@ def get_video_info(input_path: str):
             logging.warning(f"No video stream found in {input_path}")
             return None
 
-        # --- NEW: Robust duration checking ---
-        # 1. Try to get duration from the video stream first.
         duration = video_stream.get("duration")
         
-        # 2. If not in the stream, fall back to the main container format.
         if not duration:
             duration = info.get("format", {}).get("duration")
             
-        # 3. Add the reliable duration to our stream dictionary.
         video_stream['duration'] = duration
         
         return video_stream
@@ -102,14 +91,17 @@ def create_progress_bar(current, total, bar_length=20):
     spaces = '░' * (bar_length - len(arrow))
     return f"[{arrow}{spaces}] {percent:.2f}%"
 
-def humanbytes(size):
-    """Converts bytes to a human-readable format."""
+# --- UPDATED: humanbytes can now format speed ---
+def humanbytes(size, speed=False):
+    """Converts bytes to a human-readable format, optionally as a speed."""
     if not size:
         return ""
-    power = 2**10
+    power = 1024 # Use 1024 for storage/speed
     n = 0
     power_labels = {0: '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
     while size > power:
         size /= power
         n += 1
-    return f"{size:.2f} {power_labels[n]}B"
+    
+    suffix = 'B/s' if speed else 'B'
+    return f"{size:.2f} {power_labels[n]}{suffix}"
