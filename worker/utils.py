@@ -37,12 +37,22 @@ def get_video_info(input_path: str):
             logging.warning(f"No video stream found in {input_path}")
             return None
 
-        duration = video_stream.get("duration")
-        
-        if not duration:
-            duration = info.get("format", {}).get("duration")
-            
-        video_stream['duration'] = duration
+        # --- START: NEW VALIDATION BLOCK ---
+        duration_str = video_stream.get("duration")
+        if not duration_str:
+            duration_str = info.get("format", {}).get("duration")
+
+        # Clean and validate critical numeric values
+        try:
+            video_stream['duration'] = float(duration_str)
+        except (ValueError, TypeError):
+            video_stream['duration'] = 0.0
+
+        try:
+            video_stream['height'] = int(video_stream.get("height"))
+        except (ValueError, TypeError):
+            video_stream['height'] = 0
+        # --- END: NEW VALIDATION BLOCK ---
         
         return video_stream
         
