@@ -7,6 +7,7 @@ import glob
 import time
 from celery import Celery
 from celery.exceptions import Ignore
+from kombu import Queue
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 from dotenv import load_dotenv
@@ -28,7 +29,16 @@ AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 
 if REDIS_URL.startswith("rediss://"):
     REDIS_URL = f"{REDIS_URL}?ssl_cert_reqs=CERT_NONE"
+
+# --- Celery App with Priority Queues ---
 celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
+
+celery_app.conf.task_queues = (
+    Queue('high_priority', routing_key='high_priority'),
+    Queue('default', routing_key='default'),
+)
+celery_app.conf.task_default_queue = 'default'
+celery_app.conf.task_default_routing_key = 'default'
 
 async def send_status_update(user_chat_id: int, message_text: str):
     app = Client(f"status_updater_{user_chat_id}", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, in_memory=True)
@@ -56,11 +66,24 @@ async def _run_async_task(user_chat_id: int, status_message_id: int, list_of_mes
 
             merged_input_path = os.path.join(temp_dir, "merged_input.tmp")
             
-            # --- Download with Progress Bar ---
+            current_size = 0
             with open(merged_input_path, "wb") as f:
-                async for chunk in app.stream_media(first_message):
-                    f.write(chunk)
-                    # Progress update logic here... (same as before)
+                for msg_id in list_of_message_ids:
+                    async for chunk in app.stream_media(msg_id):
+                        f.write(chunk)
+                        current_size += len(chunk)
+                        
+                        now = time.time()
+                        if now - last_update_time > 5:
+                            last_update_time = now
+                            progress_bar = create_progress_bar(current_size, total_size)
+                            text = (f"📥 **Downloading:** `{original_filename}`\n"
+                                    f"{progress_bar}\n"
+                                    f"`{humanbytes(current_size)}` of `{humanbytes(total_size)}`")
+                            try:
+                                await status_message.edit_text(text)
+                            except FloodWait as e:
+                                await asyncio.sleep(e.value)
 
             await status_message.edit_text("🔬 File ready! Analyzing...")
             
@@ -72,7 +95,6 @@ async def _run_async_task(user_chat_id: int, status_message_id: int, list_of_mes
                 raise ValueError("Could not get video info. File might be corrupt.")
             
             total_duration_sec = float(video_info.get("duration", 0))
-
             original_height = int(video_info.get("height", 0))
             target_quality = int(quality)
 
@@ -84,7 +106,6 @@ async def _run_async_task(user_chat_id: int, status_message_id: int, list_of_mes
             output_filename = generate_standard_filename(original_filename, final_quality_str, BRANDING_TEXT)
             output_path = os.path.join(temp_dir, output_filename)
 
-            # --- REFACTORED: Real-time Encoding Progress ---
             ffmpeg_command = ["ffmpeg", "-i", merged_input_path, "-c:v", "libx265", "-preset", ENCODE_PRESET, "-crf", ENCODE_CRF, "-vf", f"scale=-2:{final_quality_str}", "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-metadata", f"encoder={BRANDING_TEXT}", "-y", "-progress", "pipe:1", "-nostats", output_path]
             
             process = await asyncio.create_subprocess_exec(
@@ -103,7 +124,7 @@ async def _run_async_task(user_chat_id: int, status_message_id: int, list_of_mes
                     current_time_sec = int(time_str) / 1_000_000
                     
                     now = time.time()
-                    if now - last_update_time > 5: # Update every 5 seconds
+                    if now - last_update_time > 5:
                         last_update_time = now
                         progress_bar = create_progress_bar(current_time_sec, total_duration_sec)
                         text = (f"⚙️ **Encoding:** `{output_filename}`\n"
@@ -112,27 +133,42 @@ async def _run_async_task(user_chat_id: int, status_message_id: int, list_of_mes
                             await status_message.edit_text(text)
                         except FloodWait as e:
                             await asyncio.sleep(e.value)
-                await asyncio.sleep(0.1) # Prevent busy-waiting
+                await asyncio.sleep(0.1)
 
             stderr_output = await process.stderr.read()
             if process.returncode != 0:
                 logging.error(f"FFmpeg failed! Stderr:\n{stderr_output.decode('utf-8')}")
                 raise RuntimeError("FFmpeg encountered an error during encoding.")
 
-            # --- Upload with Progress Bar ---
-            # ... (same as before) ...
-            
-            await status_message.delete()
+            async def upload_progress(current, total):
+                nonlocal last_update_time
+                now = time.time()
+                if now - last_update_time > 5:
+                    last_update_time = now
+                    progress_bar = create_progress_bar(current, total)
+                    text = (f"📤 **Uploading:** `{output_filename}`\n"
+                            f"{progress_bar}\n"
+                            f"`{humanbytes(current)}` of `{humanbytes(total)}`")
+                    try:
+                        await status_message.edit_text(text)
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value)
+
             await app.send_document(
                 user_chat_id,
                 output_path,
                 caption=f"✅ Encode Complete!\n\n`{output_filename}`",
-                thumb=thumb_path
+                thumb=thumb_path,
+                progress=upload_progress
             )
+            await status_message.delete()
+            # We can't update the bot's job queue from here directly in a simple way.
+            # A final message is sent instead.
+            await app.send_message(user_chat_id, f"🚀 Job for `{output_filename}` finished!")
 
-    except Exception as e:
-        # Final error handling logic...
-        await status_message.edit_text(f"💥 An error occurred: `{str(e)}`")
+    except (ValueError, RuntimeError) as e:
+        await status_message.edit_text(f"💥 A critical, non-retryable error occurred:\n\n`{str(e)}`")
+        raise Ignore()
     finally:
         await app.stop()
 
@@ -146,5 +182,7 @@ def encode_video_task(self, user_chat_id: int, status_message_id: int, list_of_m
     try:
         asyncio.run(_run_async_task(user_chat_id, status_message_id, list_of_message_ids, quality, thumbnail_file_id))
     except Exception as e:
-        # Retry logic...
-        pass
+        logging.warning(f"Task failed. Attempt {self.request.retries + 1}. Retrying... Error: {e}")
+        retry_message = (f"⚠️ A temporary error occurred. Retrying... (Attempt {self.request.retries + 1})")
+        asyncio.run(send_status_update(user_chat_id, retry_message))
+        raise self.retry(exc=e)
