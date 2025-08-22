@@ -37,11 +37,12 @@ def run():
     print(f"   - Accelerator CPU Worker (Prefork): {accelerator_concurrency} cores")
     print("-" * 30)
 
+    # --- UPDATED: Added unique node names (-n) to each worker ---
     commands = {
         "bot": "python bot/bot.py",
-        "io_worker": f"celery -A worker.tasks worker --loglevel=info -Q io_queue -P gevent -c {io_worker_concurrency}",
-        "worker": f"celery -A worker.tasks worker --loglevel=info -Q default -P prefork -c {worker_concurrency}",
-        "accelerator": f"celery -A worker.tasks worker --loglevel=info -Q high_priority -P prefork -c {accelerator_concurrency}"
+        "io_worker": f"celery -A worker.tasks worker --loglevel=info -Q io_queue -P gevent -c {io_worker_concurrency} -n io_worker@%h",
+        "worker": f"celery -A worker.tasks worker --loglevel=info -Q default -P prefork -c {worker_concurrency} -n worker@%h",
+        "accelerator": f"celery -A worker.tasks worker --loglevel=info -Q high_priority -P prefork -c {accelerator_concurrency} -n accelerator@%h"
     }
 
     processes = {}
