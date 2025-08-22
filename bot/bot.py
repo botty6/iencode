@@ -3,7 +3,6 @@ import logging
 import asyncio
 import re
 from collections import defaultdict
-from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.types import (
     Message,
@@ -21,11 +20,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 ADMIN_USER_IDS = [int(uid.strip()) for uid in os.getenv("ADMIN_USER_IDS", "").split(",") if uid.strip()]
-PORT = int(os.getenv("PORT", "8080"))
 
 # --- State Management for Multi-part Uploads ---
 pending_parts = defaultdict(lambda: {"message_ids": [], "timer": None})
-
 
 # --- Pyrogram Client Initialization ---
 app = Client("encoder_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp")
@@ -144,27 +141,11 @@ async def button_callback(client, callback_query: CallbackQuery):
         thumbnail_file_id=thumbnail_file_id
     )
 
-# --- Main Entrypoint ---
-async def main():
-    if not all([BOT_TOKEN, API_ID, API_HASH]):
-        logger.critical("One or more critical environment variables are missing!")
-        return
-
-    await app.start()
-    
-    webapp = web.Application()
-    webapp.add_routes([web.get("/", lambda request: web.Response(text="OK"))])
-    runner = web.AppRunner(webapp)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    logger.info(f"Starting keep-alive web server on port {PORT}")
-    await site.start()
-
-    logger.info("Bot is running!")
-    await asyncio.Event().wait()
-
+# --- Simplified Main Entrypoint ---
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped.")
+    if not all([BOT_TOKEN, API_ID, API_HASH, ADMIN_USER_IDS]):
+        logger.critical("CRITICAL: One or more environment variables are missing!")
+    else:
+        logger.info("Bot is starting...")
+        app.run()
+        logger.info("Bot has stopped.")
