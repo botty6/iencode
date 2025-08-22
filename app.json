@@ -1,9 +1,9 @@
 {
   "name": "Telegram Encoder Bot",
-  "description": "A powerful video encoding bot using Python, Celery, and FFmpeg.",
+  "description": "A powerful video encoding bot using Python, Celery, FFmpeg, and MongoDB.",
   "repository": "https://github.com/botty6/iencode",
   "logo": "https://i.imgur.com/8rq4sJt.png",
-  "keywords": ["python", "telegram", "bot", "ffmpeg", "celery", "video"],
+  "keywords": ["python", "telegram", "bot", "ffmpeg", "celery", "video", "mongo"],
   "stack": "heroku-22",
   "buildpacks": [
     {
@@ -22,26 +22,45 @@
   "env": {
     "BOT_TOKEN": {
       "description": "Your Telegram Bot API token from @BotFather.",
-      "value": "",
+      "required": true
+    },
+    "API_ID": {
+      "description": "Your Telegram API ID from my.telegram.org.",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Your Telegram API Hash from my.telegram.org.",
       "required": true
     },
     "ADMIN_USER_IDS": {
-      "description": "Comma-separated list of Telegram User IDs who are authorized to use the bot.",
-      "value": "",
+      "description": "Comma-separated list of Telegram User IDs for admins.",
+      "required": true
+    },
+    "MONGO_URI": {
+      "description": "Your MongoDB connection string URI (e.g., from MongoDB Atlas).",
       "required": true
     },
     "BRANDING_TEXT": {
-      "description": "The branding suffix to add to filenames and metadata.",
+      "description": "The default brand name to add to filenames and metadata.",
       "value": "MyEnc",
+      "required": false
+    },
+    "BRANDING_WEBSITE": {
+      "description": "The default website or channel link for metadata.",
+      "value": "t.me/YourChannel",
       "required": false
     }
   },
   "formation": {
-    "web": {
+    "bot": {
       "quantity": 1,
       "size": "basic"
     },
     "worker": {
+      "quantity": 1,
+      "size": "basic"
+    },
+    "accelerator": {
       "quantity": 1,
       "size": "basic"
     }
