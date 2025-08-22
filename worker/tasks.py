@@ -66,6 +66,7 @@ async def _run_async_task(task_id: str, user_id: int, status_message_id: int, li
     merged_input_path = os.path.join(job_cache_dir, "merged_input.mkv")
     
     try:
+        # --- CRITICAL FIX: Re-fetch messages inside the worker to get fresh file references ---
         messages = await app.get_messages(user_id, list_of_message_ids)
         if not isinstance(messages, list): messages = [messages]
 
@@ -73,11 +74,14 @@ async def _run_async_task(task_id: str, user_id: int, status_message_id: int, li
         file_meta = first_message.video or first_message.document
         original_filename = getattr(file_meta, "file_name", "unknown_file.tmp")
         
-        total_size = sum(getattr(m.video or m.document, "file_size", 0) for m in messages)
+        # Get a fresh thumbnail_id from the re-fetched message
+        fresh_thumbnail_id = None
+        if first_message.video and first_message.video.thumb:
+            fresh_thumbnail_id = first_message.video.thumb.file_id
 
-        # --- NEW: Early exit for 0 byte files ---
+        total_size = sum(getattr(m.video or m.document, "file_size", 0) for m in messages)
         if total_size == 0:
-            raise ValueError("File size equals to 0 B")
+            raise ValueError("File size is 0 B. This may be a protected file.")
 
         if os.path.exists(merged_input_path):
             await status_message.edit_text("✅ Found cached file. Skipping download.")
@@ -113,7 +117,7 @@ async def _run_async_task(task_id: str, user_id: int, status_message_id: int, li
         custom_thumbnail_id = user_settings.get("custom_thumbnail_id")
 
         thumb_path = None
-        final_thumbnail_id = custom_thumbnail_id or original_thumbnail_id
+        final_thumbnail_id = custom_thumbnail_id or fresh_thumbnail_id
         if final_thumbnail_id:
             thumb_path = await app.download_media(final_thumbnail_id, file_name=os.path.join(job_cache_dir, "thumb.jpg"))
 
@@ -190,12 +194,14 @@ async def _run_async_task(task_id: str, user_id: int, status_message_id: int, li
 
     except (ValueError, RuntimeError) as e:
         await status_message.edit_text(f"💥 A critical, non-retryable error occurred:\n\n`{str(e)}`")
-        raise Ignore() # This tells Celery to stop and NOT retry.
+        raise Ignore()
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        raise self.retry(exc=e)
     finally:
         await app.stop()
         if os.path.exists(job_cache_dir):
             shutil.rmtree(job_cache_dir)
-        # --- REMOVED: The erroneous remove_job(task_id) call ---
 
 @celery_app.task(name="worker.tasks.encode_video_task", bind=True, max_retries=3, default_retry_delay=60)
 def encode_video_task(self, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, original_thumbnail_id: str, user_settings: dict, original_task_id: str = None):
@@ -203,8 +209,7 @@ def encode_video_task(self, user_id: int, status_message_id: int, list_of_messag
         task_id = self.request.id
         asyncio.run(_run_async_task(task_id, user_id, status_message_id, list_of_message_ids, quality, original_thumbnail_id, user_settings, original_task_id))
     except Ignore:
-        # If our async code raised an Ignore exception, we don't retry.
-        pass
+        pass # Task is non-retryable, do nothing.
     except Exception as e:
         logging.warning(f"Task {self.request.id} failed. Attempt {self.request.retries + 1}. Retrying... Error: {e}")
         retry_message = (f"⚠️ A temporary error occurred. Retrying... (Attempt {self.request.retries + 1})")
