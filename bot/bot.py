@@ -43,10 +43,10 @@ async def trigger_encode_job(user_id: int, original_message: Message):
 
 def create_new_job_keyboard(identifier):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ 720p (Balanced)", callback_data=f"encode|720|{identifier}|default|medium")],
+        [InlineKeyboardButton("✅ 720p (Standard)", callback_data=f"encode|720|{identifier}|default")],
         [
-            InlineKeyboardButton("🚀 1080p (Balanced)", callback_data=f"encode|1080|{identifier}|default|medium"),
-            InlineKeyboardButton("💾 480p (Balanced)", callback_data=f"encode|480|{identifier}|default|medium"),
+            InlineKeyboardButton("🚀 1080p (Standard)", callback_data=f"encode|1080|{identifier}|default"),
+            InlineKeyboardButton("💾 480p (Standard)", callback_data=f"encode|480|{identifier}|default"),
         ]
     ])
 
@@ -70,34 +70,18 @@ async def queue_command(client, message):
         
     keyboard = []
     queue_text = "📂 **Your Active Queue:**\n\n"
-    active_job_messages = []
-
     for i, job in enumerate(jobs):
-        queue_text += f"{i+1}️⃣ `{job['filename']}` → **{job['status']}**\n"
+        job_text = f"{i+1}️⃣ `{job['filename']}` → **{job['status']}**"
         buttons = []
         if "Pending in default" in job.get('status', ''):
-            buttons.append(InlineKeyboardButton(f"⚡️ Accelerate", callback_data=f"accelerate|{job['task_id']}|fast"))
+            buttons.append(InlineKeyboardButton(f"⚡️ Accelerate", callback_data=f"accelerate|{job['task_id']}"))
         
         buttons.append(InlineKeyboardButton(f"❌ Cancel", callback_data=f"cancel|{job['task_id']}"))
-        keyboard.append(buttons)
         
-        if "Pending" not in job.get('status', ''):
-            active_job_messages.append(job['status_message_id'])
-
-    await message.reply_text(queue_text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+        queue_text += job_text + "\n"
+        keyboard.append(buttons)
     
-    if active_job_messages:
-        await message.reply_text("👇 **Live Progress for Active Jobs:**")
-        for msg_id in active_job_messages:
-            try:
-                await client.forward_messages(
-                    chat_id=user_id,
-                    from_chat_id=user_id,
-                    message_ids=msg_id
-                )
-            except Exception as e:
-                logger.warning(f"Could not forward status message {msg_id}. It might have been deleted. Error: {e}")
-
+    await message.reply_text(queue_text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
 
 @app.on_message(filters.command("settings") & filters.private)
 async def settings_command(client, message):
@@ -126,13 +110,12 @@ async def cancel_command(client, message):
         del user_states[user_id]
         await message.reply_text("Action canceled.")
 
-# --- Main File Handler ---
 @app.on_message((filters.video | filters.document | filters.photo) & filters.private)
 async def main_file_handler(client, message: Message):
     user_id = message.from_user.id
     if user_id not in ADMIN_USER_IDS: return
 
-    if user_states.get(user_id) == "custom_thumbnail_id":
+    if user_states.get(user_id) == "set_custom_thumbnail_id":
         if message.photo:
             update_user_setting(user_id, "custom_thumbnail_id", message.photo.file_id)
             await message.reply_text("✅ Thumbnail updated successfully!")
@@ -159,13 +142,12 @@ async def handle_video(client, message: Message):
         await message.reply_text(f"🎬 Received: `{file_name}`\nPlease choose quality:", reply_markup=create_new_job_keyboard(message.id))
 
 
-# --- Callback Handlers ---
 @app.on_callback_query(filters.regex(r"^encode"))
 async def button_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     if user_id not in ADMIN_USER_IDS: return
 
-    action, quality, identifier, queue_type, preset = callback_query.data.split("|", 4)
+    action, quality, identifier, queue_type = callback_query.data.split("|", 3)
     
     message_ids, original_filename, thumbnail_file_id = [], "unknown.tmp", None
     try:
@@ -189,7 +171,7 @@ async def button_callback(client, callback_query: CallbackQuery):
     user_settings = get_user_settings(user_id)
     status_message = await callback_query.message.edit_text(f"✅ Job accepted...")
     
-    task_args = (user_id, status_message.id, message_ids, quality, thumbnail_file_id, user_settings, preset)
+    task_args = (user_id, status_message.id, message_ids, quality, thumbnail_file_id, user_settings)
     
     task = celery_producer.send_task("worker.tasks.encode_video_task", args=task_args, queue=queue_type)
     
@@ -201,7 +183,7 @@ async def accelerate_callback(client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     if user_id not in ADMIN_USER_IDS: return
 
-    action, task_id_to_accelerate, preset = callback_query.data.split("|", 2)
+    action, task_id_to_accelerate = callback_query.data.split("|", 1)
     
     job_to_accelerate = get_job(task_id_to_accelerate)
     if not job_to_accelerate:
@@ -212,18 +194,17 @@ async def accelerate_callback(client, callback_query: CallbackQuery):
 
     celery_producer.control.revoke(task_id_to_accelerate, terminate=True)
     
-    original_task_args = list(job_to_accelerate["task_args"])
-    original_task_args[-1] = preset # Update the preset in the arguments
+    original_task_args = job_to_accelerate["task_args"]
     
     new_task = celery_producer.send_task(
         "worker.tasks.encode_video_task",
-        args=tuple(original_task_args),
+        args=original_task_args,
         kwargs={"original_task_id": task_id_to_accelerate},
         queue='high_priority'
     )
     
     update_job_status(task_id_to_accelerate, "⚡️ Accelerated")
-    await callback_query.message.edit_text(f"🚀 Job for `{job_to_accelerate['filename']}` is now accelerated with '{preset}' preset!")
+    await callback_query.message.edit_text(f"🚀 Job for `{job_to_accelerate['filename']}` is now accelerated!")
 
 
 @app.on_callback_query(filters.regex(r"^cancel"))
@@ -270,7 +251,6 @@ async def handle_settings_text(client, message):
         await message.reply_text(f"✅ `{state.replace('_', ' ').title()}` has been updated to: `{message.text}`")
         del user_states[user_id]
         
-# --- Main Entrypoint ---
 if __name__ == "__main__":
     if not all([BOT_TOKEN, API_ID, API_HASH, ADMIN_USER_IDS]):
         logger.critical("CRITICAL: One or more environment variables are missing!")
