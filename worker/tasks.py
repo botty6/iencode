@@ -156,10 +156,16 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
         brand_name = prep_data["user_settings"].get("brand_name", DEFAULT_BRAND)
         website = prep_data["user_settings"].get("website", DEFAULT_WEBSITE)
         
+        # --- START: NEW GUARD CLAUSE ---
         total_duration_sec = float(prep_data["video_info"].get("duration", 0))
-        if total_duration_sec <= 0: raise ValueError("Video duration is invalid.")
-
         original_height = int(prep_data["video_info"].get("height", 0))
+
+        if total_duration_sec <= 0:
+            raise ValueError("Video duration is invalid or zero. The file may be corrupt.")
+        if original_height <= 0:
+            raise ValueError("Could not determine video height. The file may be corrupt or not a video.")
+        # --- END: NEW GUARD CLAUSE ---
+
         target_quality = int(prep_data["quality"])
         if original_height > 0 and target_quality > original_height:
             target_quality = original_height
