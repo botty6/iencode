@@ -12,7 +12,6 @@ from pyrogram import Client
 from pyrogram.errors import FloodWait
 from dotenv import load_dotenv
 from .utils import get_video_info, generate_thumbnail, generate_standard_filename, create_progress_bar, humanbytes
-# --- CORRECT: Imports from the new top-level database module ---
 import database
 
 # --- Configuration ---
@@ -25,6 +24,8 @@ API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 WORKERS = int(os.getenv("UPLOAD_WORKERS", 10)) 
 DOWNLOAD_CACHE_DIR = "/tmp/iencode_downloads"
+THUMBNAIL_LOG_CHANNEL_ID = int(os.getenv("THUMBNAIL_LOG_CHANNEL_ID", "0"))
+
 os.makedirs(DOWNLOAD_CACHE_DIR, exist_ok=True)
 
 DEFAULT_BRAND = os.getenv("BRANDING_TEXT", "MyEnc")
@@ -52,28 +53,31 @@ class BaseTask(celery_app.Task):
 
 # --- TASK 1: I/O-Bound Download Task ---
 @celery_app.task(name="worker.tasks.download_task", bind=True, base=BaseTask)
-def download_task(self, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, preset: str, user_settings: dict):
+def download_task(self, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, preset: str, final_filename: str, original_thumbnail_id: str | None, user_settings: dict):
     database.update_job_status(self.request.id, "DOWNLOADING")
     try:
-        return asyncio.run(_run_download_and_prep(self.request.id, user_id, status_message_id, list_of_message_ids, quality, preset, user_settings))
+        return asyncio.run(_run_download_and_prep(self.request.id, user_id, status_message_id, list_of_message_ids, quality, preset, final_filename, original_thumbnail_id, user_settings))
     except Exception as e:
         database.update_job_status(self.request.id, "FAILED")
         raise e
 
-async def _run_download_and_prep(task_id: str, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, preset: str, user_settings: dict):
+async def _run_download_and_prep(task_id: str, user_id: int, status_message_id: int, list_of_message_ids: list, quality: str, preset: str, final_filename: str, original_thumbnail_id: str | None, user_settings: dict):
     app = Client(f"dl_{task_id}", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="/tmp", workers=WORKERS, in_memory=True)
     await app.start()
+    
     status_message = await app.get_messages(user_id, status_message_id)
     last_update_time = 0
     job_cache_dir = os.path.join(DOWNLOAD_CACHE_DIR, task_id)
     os.makedirs(job_cache_dir, exist_ok=True)
     merged_input_path = os.path.join(job_cache_dir, "merged_input.mkv")
+
     try:
         messages = await app.get_messages(user_id, list_of_message_ids)
         if not isinstance(messages, list): messages = [messages]
-        original_filename = getattr(messages[0].video or messages[0].document, "file_name", "unknown_file.tmp")
+        
         total_size = sum(getattr(m.video or m.document, "file_size", 0) for m in messages)
         if total_size == 0: raise ValueError("File size is 0 B.")
+
         start_time = time.time()
         current_size = 0
         with open(merged_input_path, "wb") as f:
@@ -87,18 +91,35 @@ async def _run_download_and_prep(task_id: str, user_id: int, status_message_id: 
                         elapsed = now - start_time
                         speed = current_size / elapsed if elapsed > 0 else 0
                         progress_bar = create_progress_bar(current_size, total_size)
-                        text = (f"📥 **Downloading:** `{original_filename}`\n{progress_bar}\n"
+                        text = (f"📥 **Downloading:** `{final_filename}`\n{progress_bar}\n"
                                 f"`{humanbytes(current_size)}` of `{humanbytes(total_size)}`\n"
                                 f"**Speed:** `{humanbytes(speed, speed=True)}`")
                         try: await status_message.edit_text(text)
                         except FloodWait as e: await asyncio.sleep(e.value)
         
-        await status_message.edit_text("🔬 Analyzing file and generating thumbnail...")
+        await status_message.edit_text("🔬 Analyzing file and preparing thumbnail...")
+        
         video_info = get_video_info(merged_input_path)
         if not video_info: raise ValueError("Could not get video info from the downloaded file.")
-        thumb_path = generate_thumbnail(merged_input_path, job_cache_dir)
+        
+        thumb_path = None
+        custom_thumb_msg_id = user_settings.get("custom_thumbnail_message_id")
+        try:
+            if custom_thumb_msg_id and THUMBNAIL_LOG_CHANNEL_ID:
+                thumb_msg = await app.get_messages(THUMBNAIL_LOG_CHANNEL_ID, custom_thumb_msg_id)
+                if thumb_msg and thumb_msg.photo:
+                     thumb_path = await app.download_media(thumb_msg.photo.file_id, file_name=os.path.join(job_cache_dir, "thumb.jpg"))
+            elif original_thumbnail_id:
+                thumb_path = await app.download_media(original_thumbnail_id, file_name=os.path.join(job_cache_dir, "thumb.jpg"))
+        except Exception as e:
+            logging.warning(f"Could not download provided thumbnail: {e}")
+            thumb_path = None
+
+        if not thumb_path or not os.path.exists(thumb_path) or os.path.getsize(thumb_path) == 0:
+            thumb_path = generate_thumbnail(merged_input_path, job_cache_dir)
+
         return {"user_id": user_id, "status_message_id": status_message_id, "input_path": merged_input_path, 
-                "job_cache_dir": job_cache_dir, "original_filename": original_filename, "quality": quality,
+                "job_cache_dir": job_cache_dir, "final_filename": final_filename, "quality": quality,
                 "preset": preset, "thumb_path": thumb_path, "video_info": video_info, "user_settings": user_settings}
     finally:
         await app.stop()
@@ -124,14 +145,14 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
         brand_name = prep_data["user_settings"].get("brand_name", DEFAULT_BRAND)
         website = prep_data["user_settings"].get("website", DEFAULT_WEBSITE)
         total_duration_sec = float(prep_data["video_info"].get("duration", 0))
-        original_height = int(prep_data["video_info"].get("height", 0))
-        if total_duration_sec <= 0: raise ValueError("Video duration is invalid or zero. The file may be corrupt.")
-        if original_height <= 0: raise ValueError("Could not determine video height. The file may be corrupt or not a video.")
-        target_quality = int(prep_data["quality"])
-        if original_height > 0 and target_quality > original_height: target_quality = original_height
-        output_filename = generate_standard_filename(prep_data["original_filename"], str(target_quality), brand_name)
+
+        # --- DYNAMIC FILENAME IS USED HERE ---
+        output_filename = prep_data.get("final_filename", "encoded_video.mkv")
         output_path = os.path.join(job_cache_dir, output_filename)
+        
         encode_preset = prep_data.get("preset", "medium")
+        target_quality = int(prep_data["quality"])
+        
         ffmpeg_command = ["ffmpeg", "-i", prep_data["input_path"], "-c:v", "libx265", "-preset", encode_preset, 
                           "-crf", ENCODE_CRF, "-tune", "grain", "-pix_fmt", "yuv420p10le", "-vf", f"scale=-2:{str(target_quality)}",
                           "-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ac", "2", "-metadata", f"encoder={brand_name}",
@@ -160,12 +181,12 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
         stdout_output, stderr_output = await process.communicate()
         if process.returncode != 0: 
             error_message = stderr_output.decode('utf-8').strip()
-            logging.error(f"FFmpeg failed for task {task_id}! Stderr:\n{error_message}")
+            logging.error(f"FFmpeg failed! Stderr:\n{error_message}")
             last_line_of_error = error_message.splitlines()[-1] if error_message else "Unknown FFmpeg error"
             raise RuntimeError(f"FFmpeg error: {last_line_of_error}")
 
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            raise RuntimeError("Encoding resulted in an empty file. The source video may be corrupt.")
+            raise RuntimeError("Encoding resulted in an empty file. Source may be corrupt.")
 
         async def upload_progress(current, total):
             nonlocal last_update_time
@@ -181,7 +202,7 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
         thumb_to_upload = None
         thumb_path_from_prep = prep_data.get("thumb_path")
         if thumb_path_from_prep and os.path.exists(thumb_path_from_prep) and os.path.getsize(thumb_path_from_prep) > 0:
-            thumb_to_upload = thumb_path_from_prep
+            thumb_to_upload = prep_data["thumb_path"]
 
         await app.send_document(user_id, output_path, caption=f"✅ Encode Complete!\n\n`{output_filename}`",
                                 thumb=thumb_to_upload, progress=upload_progress)
@@ -189,4 +210,4 @@ async def _run_encode_and_upload(task_id: str, prep_data: dict):
     finally:
         await app.stop()
         if os.path.exists(job_cache_dir): shutil.rmtree(job_cache_dir)
-            
+
