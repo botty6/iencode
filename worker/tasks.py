@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from .utils import get_video_info, generate_standard_filename, create_progress_bar, humanbytes
 
 # --- Configuration ---
+# ... (identical to previous version) ...
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 load_dotenv()
 
@@ -30,7 +31,6 @@ AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 if REDIS_URL.startswith("rediss://"):
     REDIS_URL = f"{REDIS_URL}?ssl_cert_reqs=CERT_NONE"
 
-# --- Celery App with Priority Queues ---
 celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
 
 celery_app.conf.task_queues = (
@@ -40,6 +40,7 @@ celery_app.conf.task_queues = (
 celery_app.conf.task_default_queue = 'default'
 celery_app.conf.task_default_routing_key = 'default'
 
+# ... (send_status_update is identical) ...
 async def send_status_update(user_chat_id: int, message_text: str):
     app = Client(f"status_updater_{user_chat_id}", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, in_memory=True)
     async with app:
@@ -59,23 +60,22 @@ async def _run_async_task(task_id: str, user_chat_id: int, status_message_id: in
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            # --- CRITICAL FIX: Fetch all Message objects first ---
             messages = await app.get_messages(user_chat_id, list_of_message_ids)
-            if not isinstance(messages, list): # Ensure messages is always a list
+            if not isinstance(messages, list):
                 messages = [messages]
 
             first_message = messages[0]
             file_meta = first_message.video or first_message.document
             original_filename = getattr(file_meta, "file_name", "unknown_file.tmp")
             
-            # For multi-part, sum the sizes. For single, this is just the total size.
             total_size = sum(getattr(m.video or m.document, "file_size", 0) for m in messages)
 
             merged_input_path = os.path.join(temp_dir, "merged_input.tmp")
             
+            # --- NEW: Logic for calculating download speed ---
+            start_time = time.time()
             current_size = 0
             with open(merged_input_path, "wb") as f:
-                # --- CORRECTED LOOP: Iterate through Message objects, not IDs ---
                 for message in messages:
                     async for chunk in app.stream_media(message):
                         f.write(chunk)
@@ -84,17 +84,24 @@ async def _run_async_task(task_id: str, user_chat_id: int, status_message_id: in
                         now = time.time()
                         if now - last_update_time > 5:
                             last_update_time = now
+                            
+                            elapsed_time = now - start_time
+                            speed = current_size / elapsed_time if elapsed_time > 0 else 0
+                            
                             progress_bar = create_progress_bar(current_size, total_size)
+                            # --- UPDATED: Add speed to the status message ---
                             text = (f"📥 **Downloading:** `{original_filename}`\n"
                                     f"{progress_bar}\n"
-                                    f"`{humanbytes(current_size)}` of `{humanbytes(total_size)}`")
+                                    f"`{humanbytes(current_size)}` of `{humanbytes(total_size)}`\n"
+                                    f"**Speed:** `{humanbytes(speed, speed=True)}`")
                             try:
                                 await status_message.edit_text(text)
                             except FloodWait as e:
                                 await asyncio.sleep(e.value)
-
-            await status_message.edit_text("🔬 File ready! Analyzing...")
             
+            # --- The rest of the file is identical to the previous complete version ---
+            await status_message.edit_text("🔬 File ready! Analyzing...")
+            # ... (analysis, encoding, and upload logic) ...
             if thumbnail_file_id:
                 thumb_path = await app.download_media(thumbnail_file_id, file_name=os.path.join(temp_dir, "thumb.jpg"))
 
@@ -174,6 +181,7 @@ async def _run_async_task(task_id: str, user_chat_id: int, status_message_id: in
             )
             await status_message.delete()
             await app.send_message(user_chat_id, f"🚀 Job for `{output_filename}` finished!")
+
 
     except (ValueError, RuntimeError) as e:
         await status_message.edit_text(f"💥 A critical, non-retryable error occurred:\n\n`{str(e)}`")
